@@ -31,6 +31,10 @@ def main():
     for module, package in [('PyInstaller', 'PyInstaller==6.13.0'), ('PySide6', 'PySide6==6.9.1')]:
         if importlib.util.find_spec(module) is None:
             run([sys.executable, '-m', 'pip', 'install', package])
+    from compile_translations import compile_translations
+    from PySide6.QtCore import QLibraryInfo
+    compile_translations()
+    qt_translations = Path(QLibraryInfo.path(QLibraryInfo.LibraryPath.TranslationsPath))
     ffmpeg = DEPS / 'ffmpeg.exe'
     ffprobe = DEPS / 'ffprobe.exe'
     if not ffmpeg.is_file() or not ffprobe.is_file():
@@ -39,12 +43,14 @@ def main():
         if not path.is_file(): raise SystemExit('Composant absent : ' + str(path))
     for script in ('test_architecture.py', 'test_features.py', 'test_dependencies.py',
                    'test_optional_imports.py', 'test_qt_interface.py',
-                   'test_subtitle_picker.py', 'test_download_queue.py',
+                   'test_subtitle_picker.py', 'test_download_queue.py', 'test_download_list.py',
                    'test_transfer_recovery.py', 'test_thumbnails.py',
-                   'test_analysis_queue.py'):
+                   'test_analysis_queue.py', 'test_reliability.py', 'test_logging.py', 'test_i18n.py'):
         run([sys.executable, ROOT / 'tests' / script], cwd=ROOT)
     # Build in a fresh staging directory. A failed build never touches the working EXE.
-    with tempfile.TemporaryDirectory(prefix='yd-exe-') as work:
+    # Windows may briefly lock copied binaries after the startup probe. A
+    # best-effort staging cleanup must not invalidate an installed, verified EXE.
+    with tempfile.TemporaryDirectory(prefix='yd-exe-', ignore_cleanup_errors=True) as work:
         work = Path(work)
         stage = work / 'dist'
         stage_deps = stage / '_dependencies'
@@ -53,6 +59,8 @@ def main():
              '--name', NAME, '--distpath', stage, '--workpath', work / 'build',
              '--specpath', work, '--icon', ROOT / 'assets/app-icon.ico',
              '--add-data', str(ROOT / 'assets/app-icon.ico') + ';assets',
+             '--add-data', str(ROOT / 'translations') + ';translations',
+             '--add-data', str(qt_translations / 'qtbase_fr.qm') + ';PySide6/translations',
              '--paths', ROOT / '_downloader_vendor',
              '--hidden-import', 'PySide6.QtWidgets',
              '--hidden-import', 'websocket',
@@ -79,7 +87,8 @@ def main():
         report = work / 'build-check.json'
         run([stage / (NAME + '.exe'), '--self-test', report], cwd=work, env=env, timeout=120)
         result = json.loads(report.read_text(encoding='utf-8'))
-        if not result['ok'] or not result['frozen'] or not result.get('no_tkinter'): raise RuntimeError(str(result))
+        if not all(result.get(key) for key in ('ok', 'frozen', 'no_tkinter', 'list_view', 'translations')):
+            raise RuntimeError(str(result))
         # Verify the copied multimedia binaries with Python/system FFmpeg removed from PATH.
         run([stage_deps / 'ffmpeg.exe', '-v', 'error', '-i', ROOT / 'tests/fixtures/video.mp4',
              '-i', ROOT / 'tests/fixtures/audio.m4a', '-map', '0:v', '-map', '1:a',

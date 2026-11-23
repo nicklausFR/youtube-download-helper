@@ -50,8 +50,9 @@ class DependencyManager:
         return next((str(p) for p in candidates if p.is_file()), None)
 
     def run(self, args, timeout=45, cwd=None, env=None):
+        from app_logging import start_process, process_result
         if self.cancel.is_set(): raise RuntimeError('Opération annulée')
-        proc = subprocess.Popen([str(a) for a in args], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        proc = start_process([str(a) for a in args], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL, text=True, encoding='utf-8', errors='replace',
             creationflags=FLAGS, cwd=cwd, env=env)
         deadline = time.monotonic() + timeout
@@ -63,6 +64,7 @@ class DependencyManager:
                 except subprocess.TimeoutExpired:
                     if self.cancel.is_set() or time.monotonic() > deadline:
                         raise RuntimeError('Opération annulée' if self.cancel.is_set() else 'Le composant ne répond pas dans le délai prévu')
+            process_result(proc, phase='dependency', output=output)
             if proc.returncode:
                 raise RuntimeError(output.strip()[-1800:] or f'Échec du composant ({proc.returncode})')
             return output.strip()

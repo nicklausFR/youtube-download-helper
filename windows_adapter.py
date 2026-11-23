@@ -6,14 +6,23 @@ import re
 import shutil
 import subprocess
 import sys
+from app_logging import log_event
 
 CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
+
+
+def shutdown_windows():
+    executable = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "shutdown.exe")
+    # A Windows timeout greater than zero would imply forced application closure.
+    subprocess.run([executable, "/s", "/t", "0"], check=True, timeout=10,
+                   capture_output=True, creationflags=CREATE_NO_WINDOW)
 
 
 def terminate_process_tree(process):
     """Stop the downloader and any FFmpeg/Node child it launched."""
     if process is None or process.poll() is not None:
         return
+    log_event('process.terminate_tree', pid=process.pid)
     if os.name == "nt":
         try:
             subprocess.run(

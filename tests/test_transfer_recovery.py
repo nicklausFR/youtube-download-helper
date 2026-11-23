@@ -191,7 +191,8 @@ class TransferRecovery(unittest.TestCase):
                         application().processEvents()
                         time.sleep(0.02)
                     self.assertTrue(worker.is_alive(), 'Transfer ended before the input test')
-                    self.assertGreater(window.download_progress_value, 0)
+                    self.assertGreater(window.download_progress_value, 0,
+                                       '\n'.join(window.download_detail_lines[-12:]))
                     process = window.download_process
                     self.assertIsNotNone(process)
                     clipboard.setText(added[0])
@@ -234,6 +235,12 @@ class TransferRecovery(unittest.TestCase):
                 serving.join(3)
 
     def test_disconnect_resume_and_two_live_rate_changes_keep_partial_bytes(self):
+        self.exercise_disconnect_recovery(automatic=False)
+
+    def test_disconnect_automatically_resumes_identical_bytes(self):
+        self.exercise_disconnect_recovery(automatic=True)
+
+    def exercise_disconnect_recovery(self, *, automatic):
         payload = bytes(range(256)) * 8192
         ranges = []
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -280,8 +287,12 @@ class TransferRecovery(unittest.TestCase):
             )), encoding='utf-8')
 
             commands = []
+            partial_sizes = []
             def launch(command, **kwargs):
                 if command[0] == engine.ytdlp:
+                    partial = folder / 'Resume fixture.mp4.part'
+                    if partial.is_file():
+                        partial_sizes.append(partial.stat().st_size)
                     commands.append(list(command))
                     command = command[:-1] + ['--load-info-json', str(info)]
                 return original(command, **kwargs)
@@ -309,35 +320,44 @@ class TransferRecovery(unittest.TestCase):
                 self.fail('Local transfer did not finish within 40 seconds')
 
             try:
-                with patch.object(module.subprocess, 'Popen', side_effect=launch):
+                with patch.object(module.subprocess, 'Popen', side_effect=launch), \
+                        patch.object(module, 'DOWNLOAD_RETRY_DELAYS', (0, 0, 0) if automatic else ()):
                     worker = start()
-                    self.assertEqual(terminal()[0], 'download_error')
-                    worker.join(3)
-                    partial = folder / 'Resume fixture.mp4.part'
-                    self.assertTrue(partial.is_file())
-                    self.assertGreater(partial.stat().st_size, 0)
-                    partial_bytes = partial.stat().st_size
-                    engine.set_download_rate_bps(100_000)
-                    changed = []
-                    def change_rate(event):
-                        if len(changed) == 0:
-                            engine.set_download_rate_bps(200_000)
-                            changed.append(200_000)
-                        elif len(commands) >= 3 and len(changed) == 1:
-                            engine.set_download_rate_bps(0)
-                            changed.append(0)
-                    worker = start()
-                    result = terminal(change_rate)
-                    worker.join(3)
-                    self.assertEqual(result[0], 'download_done', result)
-                    self.assertEqual(changed, [200_000, 0])
-                    self.assertGreaterEqual(len(commands), 4)
-                    self.assertEqual(ranges[1], partial_bytes, ranges)
-                    self.assertTrue(any(start >= partial_bytes for start in ranges[1:]), ranges)
+                    if automatic:
+                        result = terminal()
+                        worker.join(3)
+                        self.assertEqual(result[0], 'download_done', result)
+                        self.assertEqual(len(commands), 2)
+                        self.assertGreater(partial_sizes[0], 0)
+                        self.assertEqual(ranges, [0, partial_sizes[0]])
+                    else:
+                        self.assertEqual(terminal()[0], 'download_error')
+                        worker.join(3)
+                        partial = folder / 'Resume fixture.mp4.part'
+                        self.assertTrue(partial.is_file())
+                        self.assertGreater(partial.stat().st_size, 0)
+                        partial_bytes = partial.stat().st_size
+                        engine.set_download_rate_bps(100_000)
+                        changed = []
+                        def change_rate(event):
+                            if len(changed) == 0:
+                                engine.set_download_rate_bps(200_000)
+                                changed.append(200_000)
+                            elif len(commands) >= 3 and len(changed) == 1:
+                                engine.set_download_rate_bps(0)
+                                changed.append(0)
+                        worker = start()
+                        result = terminal(change_rate)
+                        worker.join(3)
+                        self.assertEqual(result[0], 'download_done', result)
+                        self.assertEqual(changed, [200_000, 0])
+                        self.assertGreaterEqual(len(commands), 4)
+                        self.assertEqual(ranges[1], partial_bytes, ranges)
+                        self.assertTrue(any(start >= partial_bytes for start in ranges[1:]), ranges)
                     final = folder / 'Resume fixture.mp4'
                     self.assertEqual(hashlib.sha256(final.read_bytes()).digest(),
                                      hashlib.sha256(payload).digest())
-                    self.assertFalse(partial.exists())
+                    self.assertFalse((folder / 'Resume fixture.mp4.part').exists())
                     self.assertIsNone(engine.download_process)
             finally:
                 engine.cancel()

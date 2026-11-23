@@ -61,6 +61,7 @@ class DownloadProgress:
         self.fractions = {}
         self.percent = 0.0
         self.eta_seconds = None
+        self.speed_bps = None
         self.detail_line = None
         self.detail_milestones = {}
         data = data or {}
@@ -82,6 +83,7 @@ class DownloadProgress:
     def parse(self, line):
         self.detail_line = None
         self.eta_seconds = None
+        self.speed_bps = None
         if not line.startswith(PROGRESS_PREFIX):
             return None
         try:
@@ -102,6 +104,8 @@ class DownloadProgress:
         speed = number("speed")
         eta = number("eta")
         finished = data.get("status") == "finished"
+        if not finished and speed:
+            self.speed_bps = speed
         fraction = downloaded / total if total else None
         if fraction is None and number("fragments"):
             fraction = number("fragment") / number("fragments")

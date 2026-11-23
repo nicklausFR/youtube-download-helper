@@ -20,4 +20,6 @@ build/
 _dependencies/
 _build_backups/
 youtube-download-helper.exe
+youtube-download-helper-liste.exe
 *.exe.new
+logs/

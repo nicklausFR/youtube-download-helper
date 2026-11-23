@@ -2,6 +2,10 @@
 from PySide6.QtCore import QObject, Signal, QSignalBlocker, Qt, QEvent
 from PySide6.QtGui import QFont, QPainter, QPen, QPalette
 from PySide6.QtWidgets import QApplication, QComboBox, QProgressBar, QMessageBox
+from qt_i18n import bind_text, display_text, language_manager
+
+
+SOURCE_TEXT_ROLE = Qt.ItemDataRole.UserRole + 100
 
 
 class Value(QObject):
@@ -23,6 +27,41 @@ class Value(QObject):
 
 class ArrowCombo(QComboBox):
     """A visible, palette-aware arrow with the stylesheet-based window theme."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        language_manager().languageChanged.connect(self._retranslate)
+
+    def sourceText(self, index):
+        source = self.itemData(index, SOURCE_TEXT_ROLE)
+        return source if source is not None else self.itemText(index)
+
+    def currentSourceText(self):
+        return self.sourceText(self.currentIndex())
+
+    def findText(self, text, flags=Qt.MatchFlag.MatchExactly | Qt.MatchFlag.MatchCaseSensitive):
+        for index in range(self.count()):
+            if self.sourceText(index) == text:
+                return index
+        return super().findText(text, flags)
+
+    def setCurrentText(self, text):
+        self.setCurrentIndex(self.findText(text))
+
+    def addItem(self, text, userData=None):
+        super().addItem(display_text(text), userData)
+        self.setItemData(self.count() - 1, text, SOURCE_TEXT_ROLE)
+
+    def addItems(self, texts):
+        for text in texts:
+            self.addItem(text)
+
+    def _retranslate(self, _language):
+        with QSignalBlocker(self):
+            for index in range(self.count()):
+                text = display_text(self.sourceText(index))
+                super().setItemText(index, text)
+                self.setItemData(index, text, Qt.ItemDataRole.ToolTipRole)
+
     def paintEvent(self, event):
         super().paintEvent(event)
         painter = QPainter(self)
@@ -44,18 +83,18 @@ class Choice(ArrowCombo):
         self.setMinimumContentsLength(10)
         self.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         self.setMaxVisibleItems(14)
-        self.currentTextChanged.connect(variable.set)
+        self.currentIndexChanged.connect(lambda _index: variable.set(self.currentSourceText()))
         variable.changed.connect(self._from_value)
         self.view().installEventFilter(self)
 
     def _from_value(self, value):
         with QSignalBlocker(self):
             self.setCurrentIndex(self.findText(value))
-        self.setToolTip(value)
+        bind_text(self, 'setToolTip', value)
 
     def __getitem__(self, key):
         if key != 'values': raise KeyError(key)
-        return tuple(self.itemText(i) for i in range(self.count()))
+        return tuple(self.sourceText(i) for i in range(self.count()))
 
     def __setitem__(self, key, values):
         if key != 'values': raise KeyError(key)
@@ -66,14 +105,14 @@ class Choice(ArrowCombo):
             self.setCurrentIndex(self.findText(previous))
             for i in range(self.count()):
                 self.setItemData(i, self.itemText(i), Qt.ItemDataRole.ToolTipRole)
-                if 'langue d’origine' in self.itemText(i):
+                if 'langue d’origine' in self.sourceText(i):
                     font = QFont(self.font()); font.setBold(True)
                     self.setItemData(i, font, Qt.ItemDataRole.FontRole)
 
     def current(self, index=None):
         if index is None: return self.currentIndex()
         self.setCurrentIndex(index)
-        self.variable.set(self.currentText())
+        self.variable.set(self.currentSourceText())
 
     def _handle_key(self, event):
         if self.key_handler and not event.modifiers() & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.AltModifier):
@@ -130,11 +169,11 @@ class Progress(QProgressBar):
 
 class Messages:
     @staticmethod
-    def showerror(title, text): QMessageBox.critical(QApplication.activeWindow(), title, text)
+    def showerror(title, text): QMessageBox.critical(QApplication.activeWindow(), display_text(title), display_text(text))
     @staticmethod
-    def showwarning(title, text): QMessageBox.warning(QApplication.activeWindow(), title, text)
+    def showwarning(title, text): QMessageBox.warning(QApplication.activeWindow(), display_text(title), display_text(text))
     @staticmethod
-    def showinfo(title, text): QMessageBox.information(QApplication.activeWindow(), title, text)
+    def showinfo(title, text): QMessageBox.information(QApplication.activeWindow(), display_text(title), display_text(text))
 
 
 messagebox = Messages()

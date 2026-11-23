@@ -6,6 +6,7 @@ import copy
 import json
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch, sentinel
@@ -222,12 +223,20 @@ class DownloadQueue(unittest.TestCase):
     def test_moving_list_item_changes_the_actual_next_download(self):
         self.start()
         self.start(SECOND, 'second')
+        second_row = self.download_row(0)
+        tabs = self.a.queue_tabs
+        second_preview = tabs.tabButton(1, tabs.ButtonPosition.LeftSide)
         self.start(THIRD, 'third')
+        self.assertIs(self.download_row(0), second_row)
+        self.assertIs(tabs.tabButton(1, tabs.ButtonPosition.LeftSide), second_preview)
+        third_row = self.download_row(1)
         self.a._show_queue_tab(FIRST)
         self.a.download_queue_list.setCurrentRow(0)
         self.assertTrue(self.download_row(1).up_button.isEnabled())
         self.download_row(1).up_button.click()
         self.assertEqual(self.listed_urls(), [THIRD, SECOND])
+        self.assertIs(self.download_row(0), third_row)
+        self.assertIs(self.download_row(1), second_row)
         self.assertEqual(self.a._video_tab_urls(), [FIRST, SECOND, THIRD])
         self.assertEqual(self.a.url_var.get(), FIRST)
         self.assertEqual(self.a.queue_tabs.currentIndex(), 0)
@@ -252,12 +261,25 @@ class DownloadQueue(unittest.TestCase):
         application().processEvents()
         self.a.events.put(('download_progress', 42, '42 Mo / 100 Mo'))
         self.a._poll_events()
-        QTest.mouseClick(self.download_row(0).up_button, Qt.MouseButton.LeftButton)
+        interrupted = threading.Event()
+        calling_threads = []
+        process = self.a.download_process = sentinel.transfer_process
+
+        def record_interrupt(_):
+            calling_threads.append(threading.current_thread())
+            interrupted.set()
+
+        with patch('windows_engine.terminate_process_tree', side_effect=record_interrupt) as interrupt:
+            QTest.mouseClick(self.download_row(0).up_button, Qt.MouseButton.LeftButton)
+            self.assertTrue(interrupted.wait(5))
+            interrupt.assert_called_once_with(process)
+            self.assertIsNot(calling_threads[0], threading.current_thread())
+        self.a.download_process = None
         self.assertTrue(self.a.download_pause_requested)
         self.assertEqual(self.requested_urls(), [FIRST])
         self.assertEqual(self.a.url_var.get(), FIRST)
         with patch.object(self.a.preferences, 'setValue') as save, patch.object(self.a.preferences, 'sync'):
-            save_checkpoint(self.a)
+            save_checkpoint(self.a, flush=True)
         checkpoint = json.loads(save.call_args.args[1])
         self.assertIsNone(checkpoint['active'])
         self.assertEqual([job['request'][0] for job in checkpoint['waiting']], [SECOND, FIRST, THIRD])
@@ -295,10 +317,16 @@ class DownloadQueue(unittest.TestCase):
         QTest.mouseClick(self.download_row(0).thumbnail, Qt.MouseButton.LeftButton)
         self.assertEqual(self.a.url_var.get(), SECOND)
         self.assertEqual(self.a.queue_tabs.currentIndex(), 1)
+        self.assertTrue(self.a.download_queue_list.item(0).isSelected())
+        self.assertFalse(self.a.transfer_panel.property('selected'))
         QTest.mouseClick(self.a.transfer_title_label, Qt.MouseButton.LeftButton)
         self.assertEqual(self.a.url_var.get(), FIRST)
+        self.assertTrue(self.a.transfer_panel.property('selected'))
+        self.assertFalse(self.a.download_queue_list.selectedItems())
         QTest.mouseClick(self.download_row(0).title, Qt.MouseButton.LeftButton)
         self.assertEqual(self.a.url_var.get(), SECOND)
+        self.assertTrue(self.a.download_queue_list.item(0).isSelected())
+        self.assertFalse(self.a.transfer_panel.property('selected'))
         self.download_row(0).remove_button.click()
         self.assertEqual(self.listed_urls(), [THIRD])
         self.assertIn(SECOND, self.a.pending_urls)
@@ -333,6 +361,43 @@ class DownloadQueue(unittest.TestCase):
         self.assertEqual(self.folder.call_count, 3)
         self.assertIsNone(self.a.download_thread)
         self.assertEqual(self.a.active_queue_url, UNSCHEDULED)
+
+    def test_shutdown_countdown_waits_for_the_last_download_and_can_be_cancelled(self):
+        check = self.a.shutdown_after_downloads_check
+        self.assertFalse(check.isChecked())
+        check.setChecked(True)
+        self.start()
+        self.start(SECOND)
+        with patch.object(m, 'shutdown_windows') as shutdown:
+            self.finish()
+            self.assertIsNone(self.a._shutdown_dialog)
+            self.finish()
+            dialog = self.a._shutdown_dialog
+            self.assertTrue(dialog.isVisible())
+            self.assertIn('30 s', dialog.informativeText())
+            QTest.mouseClick(dialog.button(dialog.StandardButton.Cancel), Qt.MouseButton.LeftButton)
+            self.assertIsNone(self.a._shutdown_dialog)
+            self.assertFalse(check.isChecked())
+            shutdown.assert_not_called()
+
+    def test_shutdown_is_requested_only_after_the_countdown_expires(self):
+        check = self.a.shutdown_after_downloads_check
+        check.setChecked(True)
+        with patch.object(m, 'shutdown_windows') as shutdown:
+            self.start()
+            self.finish('download_cancelled')
+            self.assertIsNone(self.a._shutdown_dialog)
+            self.start(SECOND)
+            self.finish('download_error')
+            self.assertIsNone(self.a._shutdown_dialog)
+            self.a.resume_download_button.click()
+            self.finish()
+            dialog = self.a._shutdown_dialog
+            shutdown.assert_not_called()
+            dialog._deadline.setRemainingTime(0)
+            dialog._refresh_countdown()
+            shutdown.assert_called_once_with()
+            self.assertFalse(check.isChecked())
 
     def test_button_programs_other_tab_and_disables_current_transfer(self):
         self.start()
@@ -625,7 +690,7 @@ class DownloadQueue(unittest.TestCase):
         with (
             patch.object(self.a.preferences, 'setValue') as save,
             patch.object(self.a.preferences, 'sync'),
-            patch.object(self.a, '_save_download_checkpoint', save_checkpoint.__get__(self.a)),
+            patch.object(self.a, '_save_download_checkpoint', lambda: save_checkpoint(self.a, flush=True)),
             patch.object(self.a.orchestrator, 'cancel') as cancel,
         ):
             self.a._cancel_download()
@@ -647,7 +712,7 @@ class DownloadQueue(unittest.TestCase):
         with (
             patch.object(self.a.preferences, 'setValue') as save,
             patch.object(self.a.preferences, 'sync'),
-            patch.object(self.a, '_save_download_checkpoint', save_checkpoint.__get__(self.a)),
+            patch.object(self.a, '_save_download_checkpoint', lambda: save_checkpoint(self.a, flush=True)),
         ):
             self.assertFalse(self.a.pause_download_button.isHidden())
             self.a.pause_download_button.click()
@@ -758,7 +823,7 @@ class DownloadQueue(unittest.TestCase):
         self.a._poll_events()
         with patch.object(self.a.preferences, 'setValue') as save, \
                 patch.object(self.a.preferences, 'sync'):
-            save_checkpoint(self.a)
+            save_checkpoint(self.a, flush=True)
         key, payload = save.call_args.args
         self.assertEqual(key, 'download_checkpoint')
         self.assertNotIn('secret.invalid', payload)
@@ -840,6 +905,43 @@ class DownloadQueue(unittest.TestCase):
         finally:
             restored.dispose()
 
+    def test_checkpoint_writer_keeps_latest_queue_during_a_slow_save(self):
+        self.start()
+        self.start(SECOND)
+        self.start(THIRD)
+        settings = MagicMock()
+        saving = threading.Event()
+        release = threading.Event()
+
+        def sync():
+            if not saving.is_set():
+                saving.set()
+                release.wait(5)
+
+        settings.sync.side_effect = sync
+        with (
+            patch.object(m, 'QSettings', return_value=settings),
+            patch.object(self.a, '_save_download_checkpoint', save_checkpoint.__get__(self.a)),
+        ):
+            self.a._save_download_checkpoint()
+            self.assertIsNone(self.a._checkpoint_thread)
+            QTest.qWait(200)
+            worker = self.a._checkpoint_thread
+            try:
+                self.assertTrue(saving.wait(5))
+                self.assertIsNotNone(worker)
+                self.a._move_scheduled_download(THIRD, -1)
+                self.a._remove_scheduled_download(SECOND)
+                self.assertEqual(self.listed_urls(), [THIRD])
+            finally:
+                release.set()
+                if worker is not None:
+                    worker.join(5)
+        self.assertFalse(worker.is_alive())
+        saved = [json.loads(call.args[1]) for call in settings.setValue.call_args_list]
+        self.assertEqual([[job['request'][0] for job in state['waiting']] for state in saved],
+                         [[SECOND, THIRD], [THIRD]])
+
     def test_legacy_checkpoint_restores_active_transfer_and_waiting_list(self):
         self.start()
         self.start(SECOND)
@@ -868,7 +970,7 @@ class DownloadQueue(unittest.TestCase):
         self.prepare(UNSCHEDULED)
         self.a._finish_active_queue_item()
         with patch.object(self.a.preferences, 'setValue') as save, patch.object(self.a.preferences, 'sync'):
-            save_checkpoint(self.a)
+            save_checkpoint(self.a, flush=True)
         payload = save.call_args.args[1]
         restored = m.YoutubeDownloaderApp()
         try:

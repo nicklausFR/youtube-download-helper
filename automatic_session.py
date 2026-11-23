@@ -12,6 +12,5 @@ def provider_options(base):
     return [
         '--plugin-dirs', str(root / 'plugins'),
         '--no-js-runtimes', '--js-runtimes', 'node:' + str(runtime),
-        '--extractor-args', 'youtube:player_client=mweb',
         '--extractor-args', 'youtubepot-bgutilscript:server_home=' + str(root),
     ]

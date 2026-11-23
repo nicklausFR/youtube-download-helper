@@ -9,6 +9,10 @@ from verified_session import VerifiedCredentials
 from windows_adapter import dependency_dir
 
 
+ACCESS_FALLBACK_SEPARATOR = "\n\nAccès de secours :\n"
+POT_VERSION_TIMEOUT_MESSAGE = "BgUtils n’a pas répondu à la vérification de sa version."
+
+
 def is_youtube_url(value):
     try:
         u = urlparse(value.strip())
@@ -48,7 +52,10 @@ def clean_ansi(text):
 
 
 def extraction_issue(log):
-    low = (log or "").lower()
+    first_error, _, last_error = (log or "").rpartition(ACCESS_FALLBACK_SEPARATOR)
+    if pot_provider_version_timed_out(last_error):
+        return POT_VERSION_TIMEOUT_MESSAGE + " Cliquez sur l’état de l’analyse pour le diagnostic."
+    low = last_error.lower()
     if "not a bot" in low or "anti-robot" in low:
         return "YouTube refuse l’accès avec une demande antirobot, malgré le module automatique. Réessayez plus tard."
     if "429" in low or "too many requests" in low:
@@ -59,6 +66,9 @@ def extraction_issue(log):
         return "Extraction partielle signalée par yt-dlp : certains formats peuvent manquer. Cliquez sur l’état de l’analyse pour le diagnostic."
     if "403" in low or "forbidden" in low:
         return "YouTube refuse l’accès au flux (HTTP 403) ; la cause antirobot n’est pas confirmée. Cliquez sur l’état de l’analyse pour le diagnostic."
+    if pot_provider_version_timed_out(first_error):
+        return (POT_VERSION_TIMEOUT_MESSAGE + " L’accès de secours a également échoué. "
+                "Cliquez sur l’état de l’analyse pour le diagnostic.")
     return ""
 
 
@@ -93,18 +103,24 @@ def cookie_access_failed(error):
 
 
 def access_args(session=False, analysis=False):
-    args = ["--encoding", "utf-8", "--socket-timeout", "10", "--extractor-retries", "0",
-            "--retries", "0" if analysis else "2"]
+    args = ["--ignore-config", "--encoding", "utf-8", "--socket-timeout", "20",
+            "--extractor-retries", "1", "--retries", "0" if analysis else "5",
+            "--fragment-retries", "5", "--retry-sleep", "http:exp=1:8",
+            "--retry-sleep", "fragment:exp=1:8", "--abort-on-unavailable-fragments"]
     args += ["--cookies-from-browser", "brave"] if session else ["--no-cookies-from-browser", "--no-cookies"]
     args += provider_options(os.path.join(dependency_dir(), "_pot"))
     return args
 
 
 def readable_error(error):
-    if "\n\nAccès de secours :\n" in error:
-        final_error = error.rsplit("\n\nAccès de secours :\n", 1)[1]
-        return "L’accès automatique a échoué, puis l’accès de secours a également échoué.\n\n" + readable_error(final_error)
+    first_error, separator, final_error = error.rpartition(ACCESS_FALLBACK_SEPARATOR)
+    if separator:
+        cause = (POT_VERSION_TIMEOUT_MESSAGE if pot_provider_version_timed_out(first_error)
+                 else "L’accès automatique a échoué.")
+        return cause + " L’accès de secours a également échoué.\n\n" + readable_error(final_error)
     low=error.lower()
+    if pot_provider_version_timed_out(error):
+        return POT_VERSION_TIMEOUT_MESSAGE + "\n\n" + diagnostic_log(error)[-1000:]
     if pot_provider_failed(error):
         return ("Le générateur de jetons YouTube (BgUtils) n’a pas répondu ou a échoué.\n\n"
                 "La génération du jeton n’a pas abouti. Réessayez plus tard.\n\n"
@@ -159,11 +175,26 @@ def without_forced_mweb(options):
     return result
 
 
+def alternate_youtube_options(options):
+    """Prefer yt-dlp's current clients; keep mweb with tokens as a fallback."""
+    result = without_forced_mweb(options)
+    if result != list(options) or '--plugin-dirs' not in options:
+        return result
+    return [*result, '--extractor-args', 'youtube:player_client=mweb']
+
+
+def pot_provider_version_timed_out(error):
+    # BgUtils 2.0 lets this timeout escape before the token-generation handler.
+    return bool(re.search(r"""\bgenerate_once\.js['"].*['"]--version['"].*\btimed out\b""",
+                          clean_ansi(error or ""), re.IGNORECASE))
+
+
 def pot_provider_failed(error):
     low = (error or "").lower()
     return ("_get_pot_via_script failed" in low
             or "failed while generating pot" in low
-            or ("error fetching po token" in low and "bgutil" in low))
+            or ("error fetching po token" in low and "bgutil" in low)
+            or pot_provider_version_timed_out(error))
 
 
 def without_pot_provider(options):
@@ -187,6 +218,23 @@ def subtitle_retryable(error):
     return any(text in low for text in (
         "429", "too many requests", "403", "forbidden", "timed out",
         "timeout", "unable to download video subtitles", "http error 5"))
+
+
+def transient_network_error(error):
+    """Retry transport failures, without retrying access refusals or local errors."""
+    # Earlier warnings can mention network failures even when the actual error
+    # is a removed video, a full disk, or an unavailable format.
+    final_error = clean_ansi(error or "").rsplit("ERROR:", 1)[-1].lower()
+    if re.search(r"\b(?:http(?: error)?|status(?: code)?)\s*[:=]?\s*(?:403|404|429)\b", final_error):
+        return False
+    return bool(re.search(r"\bhttp(?: error)?\s*[:=]?\s*(?:408|500|502|503|504)\b", final_error)) or any(
+        text in final_error for text in (
+            "timed out", "timeout", "connection reset", "connection aborted",
+            "remote end closed", "remote disconnected", "incomplete read", "incompleteread",
+            "content too short", "bytes read", "temporary failure in name resolution",
+            "failed to resolve", "getaddrinfo failed", "network is unreachable",
+            "connection refused", "connection closed", "winerror 10054",
+        ))
 
 
 @contextmanager

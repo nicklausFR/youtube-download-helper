@@ -1,21 +1,25 @@
 """PySide6 presentation, layout, dialogs and main-thread timers."""
+from qt_i18n import (bind_text, ui, add_translated, display_text, language_manager,
+                     LANGUAGES, tr, message, unbind_text)
 import os
 import re
 import sys
 import unicodedata
 from html import escape
-from PySide6.QtCore import Qt, QTimer, QSettings, QEvent, QPoint, QRect, QRectF, QSize, Signal
+from PySide6.QtCore import Qt, QDeadlineTimer, QTimer, QSettings, QEvent, QPoint, QRect, QRectF, QSize, QUrl, Signal
 from PySide6.QtGui import (QPixmap, QFont, QPalette, QColor, QIcon, QPainter, QPen,
-                           QAction, QActionGroup, QKeySequence, QPainterPath,
+                           QAction, QActionGroup, QDesktopServices, QKeySequence, QPainterPath,
                            QTextLayout, QTextOption)
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QFrame, QLabel,
     QPushButton, QCheckBox, QLineEdit, QComboBox, QVBoxLayout, QHBoxLayout,
     QGridLayout, QScrollArea, QSizePolicy, QButtonGroup, QDialog, QTableWidget,
     QTableWidgetItem, QHeaderView, QAbstractItemView, QPlainTextEdit, QFileDialog,
     QMessageBox, QStyle, QMenu, QSlider, QListWidget, QListWidgetItem, QTabBar, QInputDialog,
-    QDialogButtonBox, QStyleOptionButton, QStylePainter, QDoubleSpinBox, QAbstractSpinBox)
+    QDialogButtonBox, QStyleOptionButton, QStylePainter, QDoubleSpinBox, QAbstractSpinBox, QLayout,
+    QSplitter)
 from download_rate import MAX_RATE_BPS, MIN_RATE_BPS, RATE_UNITS
 from qt_controls import Value, Choice, Progress, ArrowCombo, messagebox
+from qt_download_list import DownloadTable
 from youtube_access import is_youtube_url, youtube_video_id
 
 _application = None
@@ -29,6 +33,59 @@ class RateSpinBox(QDoubleSpinBox):
             return formatted
         decimal = self.locale().decimalPoint()
         return formatted.rstrip('0').rstrip(decimal)
+
+
+class DetailThumbnail(QWidget):
+    def __init__(self, placeholder):
+        super().__init__()
+        self.image = QPixmap()
+        self.content = None
+        self.placeholder = placeholder
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
+        bind_text(self, 'setAccessibleName', 'Vignette de la vidéo sélectionnée')
+
+    def aspect_ratio(self):
+        return 16 / 9 if self.image.isNull() else self.image.width() / self.image.height()
+
+    def set_content(self, content):
+        if self.content is content:
+            return
+        self.content = content
+        self.image = QPixmap()
+        if content:
+            self.image.loadFromData(content)
+        self.updateGeometry()
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        if self.image.isNull():
+            painter.drawPixmap((self.width() - self.placeholder.width()) // 2,
+                               (self.height() - self.placeholder.height()) // 2, self.placeholder)
+        else:
+            ratio = self.aspect_ratio()
+            height = min(self.height(), self.width() / ratio)
+            width = height * ratio
+            target = QRectF((self.width() - width) / 2, (self.height() - height) / 2, width, height)
+            painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+            painter.drawPixmap(target, self.image, QRectF(self.image.rect()))
+        painter.end()
+
+
+class VideoIdentityLayout(QHBoxLayout):
+    def setGeometry(self, rect):
+        QLayout.setGeometry(self, rect)
+        if self.count() != 2:
+            return
+        thumbnail, details = self.itemAt(0), self.itemAt(1)
+        area = self.contentsRect()
+        gap = self.spacing()
+        right = area.x() + area.width()
+        available_width = max(0, right - rect.x() - gap - details.minimumSize().width())
+        width = min(available_width, round(rect.height() * thumbnail.widget().aspect_ratio()))
+        thumbnail.setGeometry(QRect(rect.x(), rect.y(), width, rect.height()))
+        left = rect.x() + width + gap if width else area.x()
+        details.setGeometry(QRect(left, area.y(), max(0, right - left), area.height()))
 
 
 def bundled_asset(name):
@@ -48,7 +105,7 @@ class MediaRangeSlider(QSlider):
         self._allowed_values = None
         self.setMinimumHeight(38)
         self.setMouseTracking(True)
-        self.setAccessibleName('Sélection de l’extrait')
+        bind_text(self, 'setAccessibleName', 'Sélection de l’extrait')
 
     def setSelection(self, start, end):
         maximum = max(0, self.maximum())
@@ -402,11 +459,11 @@ class VideoTabStrip(QWidget):
         hidden_right = [rect for rect in rects if rect.right() >= right_edge]
         left_count = sum(rect.right() < self._offset for rect in hidden_left)
         right_count = sum(rect.left() >= right_edge for rect in hidden_right)
-        self.left_button.setText(f'‹ +{left_count}' if left_count else '‹')
-        self.right_button.setText(f'+{right_count} ›' if right_count else '›')
-        self.left_button.setToolTip(f'Onglets masqués à gauche · {left_count}' if left_count
+        bind_text(self.left_button, 'setText', f'‹ +{left_count}' if left_count else '‹')
+        bind_text(self.right_button, 'setText', f'+{right_count} ›' if right_count else '›')
+        bind_text(self.left_button, 'setToolTip', f'Onglets masqués à gauche · {left_count}' if left_count
                                     else 'Défiler vers la gauche')
-        self.right_button.setToolTip(f'Onglets masqués à droite · {right_count}' if right_count
+        bind_text(self.right_button, 'setToolTip', f'Onglets masqués à droite · {right_count}' if right_count
                                      else 'Défiler vers la droite')
         y = max(0, (self.height() - self.left_button.height()) // 2)
         self.left_button.move(0, y)
@@ -478,7 +535,7 @@ class VideoTabPreview(QWidget):
         state_row.addWidget(self.state, 1)
         self.download_progress = Progress(compact=True)
         self.download_progress.setFixedWidth(104)
-        self.download_progress.setAccessibleName('Progression du téléchargement')
+        bind_text(self.download_progress, 'setAccessibleName', 'Progression du téléchargement')
         self.download_progress.hide()
         state_row.addWidget(self.download_progress, 1, Qt.AlignmentFlag.AlignLeft)
         labels.addLayout(state_row)
@@ -564,6 +621,32 @@ class DownloadQueueRow(QFrame):
         super().mouseReleaseEvent(event)
 
 
+class ShutdownCountdown(QMessageBox):
+    def __init__(self, parent):
+        super().__init__(QMessageBox.Icon.Warning, 'Arrêt de l’ordinateur',
+                         'Tous les téléchargements sont terminés.',
+                         QMessageBox.StandardButton.Cancel, parent)
+        bind_text(self, 'setWindowTitle', 'Arrêt de l’ordinateur')
+        bind_text(self, 'setText', 'Tous les téléchargements sont terminés.')
+        cancel = self.button(QMessageBox.StandardButton.Cancel)
+        bind_text(cancel, 'setText', 'Annuler l’arrêt')
+        self.setDefaultButton(cancel)
+        self.setEscapeButton(cancel)
+        self._deadline = QDeadlineTimer(30_000, Qt.TimerType.PreciseTimer)
+        self._clock = QTimer(self)
+        self._clock.timeout.connect(self._refresh_countdown)
+        self.finished.connect(self._clock.stop)
+        self._refresh_countdown()
+        self._clock.start(250)
+
+    def _refresh_countdown(self):
+        seconds = (self._deadline.remainingTime() + 999) // 1000
+        if seconds:
+            bind_text(self, 'setInformativeText', f'L’ordinateur s’arrêtera dans {seconds} s.')
+        else:
+            self.accept()
+
+
 def application():
     global _application
     if _application is None:
@@ -571,6 +654,7 @@ def application():
         _application.setStyle('Fusion')
         _application.setApplicationName('Téléchargeur YouTube')
         _application.setOrganizationName('YouTubeDownloadHelper')
+        bind_text(_application, 'setApplicationDisplayName', 'Téléchargeur YouTube')
         icon_path = bundled_asset('app-icon.ico')
         if os.path.isfile(icon_path):
             _application.setWindowIcon(QIcon(icon_path))
@@ -585,20 +669,13 @@ class DownloaderWindow(QMainWindow):
         self._disposed = False
         self._closing = False
         self.preferences = QSettings()
-        self._extended_title_bar = (application().platformName() == 'windows'
-                                    and hasattr(Qt.WindowType, 'ExpandedClientAreaHint'))
-        if self._extended_title_bar:
-            # QWidget.setWindowFlags adds WindowTitleHint back for caption buttons.
-            # Set the flags before creating the handle so only our label draws the title.
-            self.overrideWindowFlags(
-                Qt.WindowType.Window | Qt.WindowType.ExpandedClientAreaHint
-                | Qt.WindowType.NoTitleBarBackgroundHint | Qt.WindowType.CustomizeWindowHint
-                | Qt.WindowType.WindowSystemMenuHint | Qt.WindowType.WindowMinMaxButtonsHint
-                | Qt.WindowType.WindowCloseButtonHint)
-            self.setAttribute(Qt.WidgetAttribute.WA_ContentsMarginsRespectsSafeArea, False)
+        language_manager().set_language(self.preferences.value('language', 'fr'))
+        language_manager().languageChanged.connect(self._language_changed)
+        # Keep the native caption. Qt 6.9's expanded client area creates a
+        # separate window for the buttons that can stay visible when minimized.
         self.resize(880, 760)
         self.setMinimumSize(640, 530)
-        self.setWindowTitle('Téléchargeur YouTube')
+        bind_text(self, 'setWindowTitle', 'Téléchargeur YouTube')
         self.setWindowIcon(application().windowIcon())
         self.setAcceptDrops(True)
 
@@ -625,7 +702,9 @@ class DownloaderWindow(QMainWindow):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        if hasattr(self, 'download_queue_list'):
+        if hasattr(self, 'selected_video_panel'):
+            self._update_selected_video_layout()
+        if hasattr(self, 'download_queue_list') and not self.list_view:
             self._fit_download_queue_height()
 
     def dispose(self):
@@ -640,8 +719,8 @@ class DownloaderWindow(QMainWindow):
             event.accept()
             return
         if self.download_thread is not None:
-            answer = QMessageBox.question(self, 'Téléchargement en cours',
-                'Interrompre le téléchargement et fermer le programme ?',
+            answer = QMessageBox.question(self, tr('Téléchargement en cours'),
+                tr('Interrompre le téléchargement et fermer le programme ?'),
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No)
             if answer != QMessageBox.StandardButton.Yes:
@@ -662,15 +741,15 @@ class DownloaderWindow(QMainWindow):
         layout.setSpacing(spacing)
         return layout
 
-    def _label(self, variable=None, text='', name='', wrap=False):
-        label = QLabel(text)
+    def _label(self, variable=None, text='', name='', wrap=False, translate=True):
+        label = ui(QLabel(), text=text) if translate else QLabel(text)
         label.setObjectName(name)
         label.setWordWrap(wrap)
         label.setTextFormat(Qt.TextFormat.PlainText)
         label.setMinimumWidth(0)
         if variable is not None:
-            label.setText(variable.get())
-            variable.changed.connect(label.setText)
+            bind_text(label, 'setText', variable.get())
+            variable.changed.connect(lambda source: bind_text(label, 'setText', source))
         return label
 
     def _field(self, label, variable, name):
@@ -678,7 +757,7 @@ class DownloaderWindow(QMainWindow):
         layout = self._layout(widget, spacing=6)
         caption = self._label(text=label, name='fieldLabel')
         combo = Choice(variable, widget)
-        combo.setAccessibleName(label)
+        bind_text(combo, 'setAccessibleName', label)
         caption.setBuddy(combo)
         layout.addWidget(caption); layout.addWidget(combo)
         setattr(self, name, combo)
@@ -688,14 +767,14 @@ class DownloaderWindow(QMainWindow):
         widget = QWidget()
         layout = self._layout(widget, spacing=6)
         caption = self._label(text='Sous-titres', name='fieldLabel')
-        self.subtitle_combo = QPushButton(self.subtitle_var.get())
+        self.subtitle_combo = ui(QPushButton(), text=self.subtitle_var.get())
         self.subtitle_combo.setObjectName('subtitlePicker')
-        self.subtitle_combo.setAccessibleName('Choisir plusieurs sous-titres')
-        self.subtitle_combo.setToolTip('Choisir une ou plusieurs langues de sous-titres.')
+        bind_text(self.subtitle_combo, 'setAccessibleName', 'Choisir plusieurs sous-titres')
+        bind_text(self.subtitle_combo, 'setToolTip', 'Choisir une ou plusieurs langues de sous-titres.')
         self.subtitle_combo.setMinimumWidth(0)
         self.subtitle_combo.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self.subtitle_combo.clicked.connect(self._open_subtitle_picker)
-        self.subtitle_var.changed.connect(self.subtitle_combo.setText)
+        self.subtitle_var.changed.connect(lambda source: bind_text(self.subtitle_combo, 'setText', source))
         caption.setBuddy(self.subtitle_combo)
         layout.addWidget(caption)
         layout.addWidget(self.subtitle_combo)
@@ -705,17 +784,15 @@ class DownloaderWindow(QMainWindow):
         widget = QWidget()
         layout = self._layout(widget, spacing=6)
         caption = self._label(text='Langues audio', name='fieldLabel')
-        self.audio_language_picker = QPushButton(
-            self.audio_language_summary_var.get())
+        self.audio_language_picker = ui(QPushButton(), text=self.audio_language_summary_var.get())
         self.audio_language_picker.setObjectName('subtitlePicker')
-        self.audio_language_picker.setAccessibleName(
-            'Choisir plusieurs langues audio')
+        bind_text(self.audio_language_picker, 'setAccessibleName', 'Choisir plusieurs langues audio')
         self.audio_language_picker.setMinimumWidth(0)
         self.audio_language_picker.setSizePolicy(
             QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self.audio_language_picker.clicked.connect(self._open_audio_language_picker)
         self.audio_language_summary_var.changed.connect(
-            self.audio_language_picker.setText)
+            lambda source: bind_text(self.audio_language_picker, 'setText', source))
         caption.setBuddy(self.audio_language_picker)
         layout.addWidget(caption)
         layout.addWidget(self.audio_language_picker)
@@ -732,11 +809,11 @@ class DownloaderWindow(QMainWindow):
         selected = set(self._selected_audio_language_labels())
         working = set(selected)
         dialog = QDialog(self)
-        dialog.setWindowTitle('Choisir les langues audio')
+        bind_text(dialog, 'setWindowTitle', 'Choisir les langues audio')
         dialog.resize(560, 430)
         layout = self._layout(dialog, margins=18, spacing=10)
         search = QLineEdit()
-        search.setPlaceholderText('Rechercher une langue : français, anglais…')
+        bind_text(search, 'setPlaceholderText', 'Rechercher une langue : français, anglais…')
         search.setClearButtonEnabled(True)
         layout.addWidget(search)
         audio_list = QListWidget()
@@ -748,16 +825,14 @@ class DownloaderWindow(QMainWindow):
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok |
             QDialogButtonBox.StandardButton.Cancel)
-        clear = buttons.addButton(
-            'Tout effacer', QDialogButtonBox.ButtonRole.ResetRole)
-        buttons.button(QDialogButtonBox.StandardButton.Ok).setText('Valider')
-        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText('Annuler')
+        clear = add_translated(buttons, 'addButton', 'Tout effacer', QDialogButtonBox.ButtonRole.ResetRole)
+        bind_text(buttons.button(QDialogButtonBox.StandardButton.Ok), 'setText', 'Valider')
+        bind_text(buttons.button(QDialogButtonBox.StandardButton.Cancel), 'setText', 'Annuler')
         layout.addWidget(buttons)
 
         def update_info():
             count = len(working)
-            info.setText(
-                'Aucune langue sélectionnée' if not count else
+            bind_text(info, 'setText', 'Aucune langue sélectionnée' if not count else
                 '1 langue sélectionnée' if count == 1 else
                 f'{count} langues sélectionnées')
 
@@ -774,9 +849,9 @@ class DownloaderWindow(QMainWindow):
             audio_list.blockSignals(True)
             audio_list.clear()
             for label in choices:
-                if query and query not in self._subtitle_filter_text(label):
+                if query and query not in self._subtitle_filter_text(label + ' ' + display_text(label)):
                     continue
-                item = QListWidgetItem(label)
+                item = ui(QListWidgetItem(), text=label)
                 item.setData(Qt.ItemDataRole.UserRole, label)
                 item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
                 item.setCheckState(
@@ -813,14 +888,14 @@ class DownloaderWindow(QMainWindow):
         selected = set(self._selected_subtitle_codes())
         working = set(selected)
         dialog = QDialog(self)
-        dialog.setWindowTitle('Choisir les sous-titres')
+        bind_text(dialog, 'setWindowTitle', 'Choisir les sous-titres')
         dialog.resize(590, 500)
         layout = self._layout(dialog, margins=18, spacing=10)
         search = QLineEdit()
-        search.setPlaceholderText('Rechercher une langue : français, fr, anglais…')
+        bind_text(search, 'setPlaceholderText', 'Rechercher une langue : français, fr, anglais…')
         search.setClearButtonEnabled(True)
         layout.addWidget(search)
-        show_all = QCheckBox('Afficher les autres traductions automatiques')
+        show_all = ui(QCheckBox(), text='Afficher les autres traductions automatiques')
         layout.addWidget(show_all)
         subtitle_list = QListWidget()
         subtitle_list.setAlternatingRowColors(True)
@@ -831,9 +906,9 @@ class DownloaderWindow(QMainWindow):
         info.setWordWrap(True)
         layout.addWidget(info)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        clear = buttons.addButton('Tout effacer', QDialogButtonBox.ButtonRole.ResetRole)
-        buttons.button(QDialogButtonBox.StandardButton.Ok).setText('Valider')
-        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText('Annuler')
+        clear = add_translated(buttons, 'addButton', 'Tout effacer', QDialogButtonBox.ButtonRole.ResetRole)
+        bind_text(buttons.button(QDialogButtonBox.StandardButton.Ok), 'setText', 'Valider')
+        bind_text(buttons.button(QDialogButtonBox.StandardButton.Cancel), 'setText', 'Annuler')
         layout.addWidget(buttons)
 
         ordered = sorted(tracks, key=lambda track: (
@@ -849,7 +924,7 @@ class DownloaderWindow(QMainWindow):
                 '1 piste sélectionnée' if chosen == 1 else f'{chosen} pistes sélectionnées')
             suffix = (f' · {hidden} traduction masquée' if hidden == 1 else
                       f' · {hidden} traductions masquées' if hidden else '')
-            info.setText(selection + suffix)
+            bind_text(info, 'setText', selection + suffix)
 
         def item_changed(item):
             code = item.data(Qt.ItemDataRole.UserRole)
@@ -868,18 +943,18 @@ class DownloaderWindow(QMainWindow):
                 code = track['code']
                 base = code.lower().removesuffix('-orig').split('-')[0]
                 translated = track.get('kind') == 'traduction auto'
-                haystack = self._subtitle_filter_text(code + ' ' + track['label'])
+                haystack = self._subtitle_filter_text(code + ' ' + track['label'] + ' ' + display_text(track['label']))
                 recommended = (not translated or track.get('original') or base in ('fr', 'en') or code in working)
                 visible = query in haystack if query else (show_all.isChecked() or recommended)
                 if not visible:
                     if translated:
                         hidden += 1
                     continue
-                item = QListWidgetItem(track['label'])
+                item = ui(QListWidgetItem(), text=track['label'])
                 item.setData(Qt.ItemDataRole.UserRole, code)
                 item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
                 item.setCheckState(Qt.CheckState.Checked if code in working else Qt.CheckState.Unchecked)
-                item.setToolTip(track.get('tooltip', track['label'] + '\nCode : ' + code))
+                bind_text(item, 'setToolTip', track.get('tooltip', track['label'] + '\nCode : ' + code))
                 subtitle_list.addItem(item)
             subtitle_list.blockSignals(False)
             hidden_count[0] = hidden
@@ -901,7 +976,7 @@ class DownloaderWindow(QMainWindow):
             self._set_selected_subtitles([track['code'] for track in ordered if track['code'] in working])
 
     def _button(self, text, callback, name='', icon=None):
-        button = QPushButton(text)
+        button = ui(QPushButton(), text=text)
         button.setObjectName(name)
         if icon is not None: button.setIcon(self.style().standardIcon(icon))
         button.clicked.connect(callback)
@@ -916,55 +991,45 @@ class DownloaderWindow(QMainWindow):
         else:
             button.setMinimumWidth(110)
 
-    def _build_title_bar(self):
-        self.title_bar = QFrame()
-        self.title_bar.setObjectName('titleBar')
-        self.title_bar.setFixedHeight(32)
-        row = self._layout(self.title_bar, QHBoxLayout, spacing=8)
-        row.setContentsMargins(16, 5, 8, 5)
-        if self._extended_title_bar:
-            icon_label = QLabel()
-            icon_label.setPixmap(self.windowIcon().pixmap(QSize(16, 16), self.devicePixelRatioF()))
-            icon_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
-            row.addWidget(icon_label)
-            caption = self._label(text=self.windowTitle(), name='windowCaption')
-            caption.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
-            self.windowTitleChanged.connect(caption.setText)
-            row.addWidget(caption)
-        row.addStretch()
-        self.options_button = QPushButton()
+    def _build_options_menu(self):
+        self.options_button = QPushButton(self)
         self.options_button.setObjectName('optionsButton')
-        self.options_button.setAccessibleName('Options')
-        self.options_button.setToolTip('Thème et dépendances')
-        self.options_button.setFixedWidth(42)
+        bind_text(self.options_button, 'setAccessibleName', 'Options')
+        bind_text(self.options_button, 'setToolTip', 'Thème, langue et dépendances')
+        self.options_button.setFixedSize(36, 36)
         self.options_button.setIconSize(QSize(20, 20))
-        row.addWidget(self.options_button)
-        self.setMenuWidget(self.title_bar)
 
         self.options_menu = QMenu(self)
         self.options_button.clicked.connect(self._open_options_menu)
-        themes = self.options_menu.addMenu('Thème')
+        themes = add_translated(self.options_menu, 'addMenu', 'Thème')
         self.theme_actions = {}
         theme_group = QActionGroup(self); theme_group.setExclusive(True)
         for theme in ('Système','Clair','Sombre'):
-            action = themes.addAction(theme); action.setCheckable(True)
+            action = add_translated(themes, 'addAction', theme); action.setCheckable(True)
             action.setChecked(theme == self.theme_value); theme_group.addAction(action)
             action.triggered.connect(lambda checked=False,value=theme:self._theme_changed(value))
             self.theme_actions[theme] = action
+        languages = add_translated(self.options_menu, 'addMenu', 'Langue')
+        self.language_actions = {}
+        language_group = QActionGroup(self)
+        language_group.setExclusive(True)
+        for code, name in LANGUAGES.items():
+            action = languages.addAction(name)
+            action.setCheckable(True)
+            action.setChecked(code == language_manager().language)
+            language_group.addAction(action)
+            action.triggered.connect(lambda checked=False, value=code: self._set_language(value))
+            self.language_actions[code] = action
         self.options_menu.addSeparator()
-        self.options_menu.addAction('Dépendances',self._show_dependencies)
+        add_translated(self.options_menu, 'addAction', 'Dépendances', self._show_dependencies)
 
-        if self._extended_title_bar:
-            self.winId()
-            handle = self.windowHandle()
-            handle.safeAreaMarginsChanged.connect(self._resize_title_bar)
-            self._resize_title_bar(handle.safeAreaMargins())
+    def _set_language(self, language):
+        language_manager().set_language(language)
+        self.preferences.setValue('language', language_manager().language)
 
-    def _resize_title_bar(self, margins):
-        caption_height = margins.top()
-        self.title_bar.setFixedHeight(max(32, caption_height))
-        # The Windows Qt backend gives each of the three caption buttons 1.5 times the caption height.
-        self.title_bar.layout().setContentsMargins(16, 5, (9 * caption_height + 1) // 2 + 4, 5)
+    def _language_changed(self, language):
+        for code, action in getattr(self, 'language_actions', {}).items():
+            action.setChecked(code == language)
 
     def _open_options_menu(self):
         origin = self.options_button.mapToGlobal(QPoint(0, self.options_button.height()))
@@ -972,7 +1037,7 @@ class DownloaderWindow(QMainWindow):
 
     def _build_ui(self):
         self.theme_value = self.preferences.value('theme', 'Système')
-        self._build_title_bar()
+        self._build_options_menu()
         central = QWidget(); self.setCentralWidget(central)
         outer = self._layout(central, spacing=0)
         self.scroll_area = QScrollArea(); self.scroll_area.setWidgetResizable(True)
@@ -995,23 +1060,23 @@ class DownloaderWindow(QMainWindow):
         source_layout = self._layout(self.source_panel, QHBoxLayout, margins=12, spacing=8)
         self.new_link_button = self._button('+', self._new_link, 'addVideo')
         self.new_link_button.setFixedWidth(52)
-        self.new_link_button.setAccessibleName('Ajouter une vidéo')
-        self.new_link_button.setToolTip('Ajouter un lien YouTube')
+        bind_text(self.new_link_button, 'setAccessibleName', 'Ajouter une vidéo')
+        bind_text(self.new_link_button, 'setToolTip', 'Ajouter un lien YouTube')
         self.video_tab_strip = VideoTabStrip(self.new_link_button)
         self.queue_tabs = self.video_tab_strip.tabs
         self.queue_tabs.setObjectName('videoTabs')
         self.queue_tabs.setDocumentMode(True)
         self.queue_tabs.setDrawBase(False)
         self.queue_tabs.setExpanding(False)
-        self.queue_tabs.setAccessibleName('Vidéos ouvertes')
+        bind_text(self.queue_tabs, 'setAccessibleName', 'Vidéos ouvertes')
         self.queue_tabs.tabCloseRequested.connect(self._remove_queued_url)
         self.queue_tabs.currentChanged.connect(self._queue_tab_clicked)
-        self.paste_video_link_action = QAction('Coller un lien', self.source_panel)
+        self.paste_video_link_action = ui(QAction(self.source_panel), text='Coller un lien')
         self.paste_video_link_action.triggered.connect(self._paste_video_link)
-        self.retry_analysis_action = QAction('Relancer l’analyse', self.source_panel)
+        self.retry_analysis_action = ui(QAction(self.source_panel), text='Relancer l’analyse')
         self.retry_analysis_action.triggered.connect(self._retry_analysis)
         self.retry_analysis_action.setEnabled(False)
-        self.analysis_diagnostic_action = QAction('Diagnostic de l’analyse', self.source_panel)
+        self.analysis_diagnostic_action = ui(QAction(self.source_panel), text='Diagnostic de l’analyse')
         self.analysis_diagnostic_action.triggered.connect(self._show_diagnostic)
         self.analysis_diagnostic_action.setEnabled(False)
         for widget in (self.source_panel, self.queue_tabs):
@@ -1021,11 +1086,73 @@ class DownloaderWindow(QMainWindow):
             widget.addAction(self.analysis_diagnostic_action)
         source_layout.addWidget(self.video_tab_strip, 1)
         outer.addWidget(self.source_panel)
+        if self.list_view:
+            self.source_panel.hide()
+            self.resize(1270, 850)
+            self.setMinimumSize(780, 570)
+            splitter = QSplitter(Qt.Orientation.Vertical)
+            self.download_table = DownloadTable(self)
+            self.download_table.toolbar.addWidget(self.options_button)
+            splitter.addWidget(self.download_table)
+            outer.addWidget(splitter, 1)
+        else:
+            source_layout.addWidget(self.options_button)
 
         self.video_panel = QWidget()
         video = self._layout(self.video_panel, spacing=0)
-        video.addWidget(self.scroll_area, 1)
-        outer.addWidget(self.video_panel, 1)
+        self.selected_video_panel = QFrame()
+        self.selected_video_panel.setObjectName('selectedVideo')
+        bind_text(self.selected_video_panel, 'setAccessibleName', 'Vidéo sélectionnée')
+        layout_class = VideoIdentityLayout if self.list_view else QHBoxLayout
+        identity = self._layout(self.selected_video_panel, layout_class, margins=14, spacing=12)
+        if self.list_view:
+            self.selected_video_thumbnail = DetailThumbnail(self.windowIcon().pixmap(28, 28))
+        else:
+            self.selected_video_thumbnail = QLabel()
+            self.selected_video_thumbnail.setObjectName('tabThumbnail')
+            self.selected_video_thumbnail.setFixedSize(96, 54)
+            self.selected_video_thumbnail.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        identity.addWidget(self.selected_video_thumbnail)
+        labels = QVBoxLayout(); labels.setSpacing(3)
+        self.selected_video_heading = self._label(text='Vidéo sélectionnée', name='selectedVideoHeading')
+        self.selected_video_title = self._label(name='selectedVideoTitle', wrap=True, translate=False)
+        self.selected_video_title.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.selected_video_title.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.selected_video_meta = self._label(name='muted', wrap=True, translate=False)
+        self.selected_video_url = self._label(name='muted', translate=False)
+        self.selected_video_url.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        if self.list_view:
+            self.selected_video_url.setTextInteractionFlags(Qt.TextInteractionFlag.LinksAccessibleByMouse
+                                                            | Qt.TextInteractionFlag.LinksAccessibleByKeyboard)
+            self.selected_video_url.linkActivated.connect(self._open_video_link)
+        for label in (self.selected_video_heading, self.selected_video_title,
+                      self.selected_video_meta, self.selected_video_url):
+            labels.addWidget(label)
+        if self.list_view:
+            self.selected_video_description = QPlainTextEdit()
+            self.selected_video_description.setObjectName('selectedVideoDescription')
+            bind_text(self.selected_video_description, 'setAccessibleName', 'Description de la vidéo sélectionnée')
+            self.selected_video_description.setReadOnly(True)
+            self.selected_video_description.setMinimumHeight(64)
+            self.selected_video_description.hide()
+            labels.addWidget(self.selected_video_description, 1)
+        identity.addLayout(labels, 1)
+        video.addWidget(self.selected_video_panel, 1 if self.list_view else 0)
+        self.selected_video_panel.hide()
+        video.addWidget(self.scroll_area, 0 if self.list_view else 1)
+        if self.list_view:
+            self.scroll_area.setMaximumHeight(100)
+            self.list_detail_pane = QWidget()
+            detail_layout = QVBoxLayout(self.list_detail_pane)
+            detail_layout.setContentsMargins(0, 0, 0, 0)
+            detail_layout.addWidget(self.video_panel, 1)
+            splitter.addWidget(self.list_detail_pane)
+            splitter.setCollapsible(0, False)
+            splitter.setStretchFactor(0, 3)
+            splitter.setStretchFactor(1, 2)
+            splitter.setSizes([510, 270])
+        else:
+            outer.addWidget(self.video_panel, 1)
         self.analysis_panel = QWidget()
         self._analysis_indicator_active = False
         analysis_row = self._layout(self.analysis_panel, QHBoxLayout, spacing=6)
@@ -1043,8 +1170,8 @@ class DownloaderWindow(QMainWindow):
         self.status_label.setWordWrap(True)
         self.status_label.setTextFormat(Qt.TextFormat.PlainText)
         self.status_label.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.status_label.setToolTip('Afficher le diagnostic de l’analyse')
-        self.status_label.setAccessibleName('État de l’analyse — ouvrir le diagnostic')
+        bind_text(self.status_label, 'setToolTip', 'Afficher le diagnostic de l’analyse')
+        bind_text(self.status_label, 'setAccessibleName', 'État de l’analyse — ouvrir le diagnostic')
         self.status_var.changed.connect(self._show_analysis_status)
         self.status_label.clicked.connect(self._show_diagnostic)
         self.analysis_retry_button = self._button('Réessayer l’accès', self._retry_analysis_now, 'retryAnalysis')
@@ -1067,7 +1194,7 @@ class DownloaderWindow(QMainWindow):
         self.mode_group = QButtonGroup(self); self.mode_group.setExclusive(True)
         self.mode_buttons = {}
         for label, mode in [('Tout','video'),('Vidéo seule','video_only'),('Audio seul','audio'),('SRT uniquement','subtitles')]:
-            button = QPushButton(label); button.setCheckable(True); button.setObjectName('segment')
+            button = ui(QPushButton(), text=label); button.setCheckable(True); button.setObjectName('segment')
             button.clicked.connect(lambda checked=False, value=mode: self._select_mode(value))
             self.mode_buttons[mode] = button; self.mode_group.addButton(button); segments.addWidget(button, 1)
         self.mode_var.changed.connect(self._mark_mode)
@@ -1085,7 +1212,7 @@ class DownloaderWindow(QMainWindow):
         settings.addWidget(self.selection_frame)
         self.settings_row = QWidget(); advanced_row = self._layout(self.settings_row, QHBoxLayout)
         self.settings_row.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
-        self.advanced_check = QCheckBox('Réglages avancés')
+        self.advanced_check = ui(QCheckBox(), text='Réglages avancés')
         self.advanced_check.toggled.connect(self._toggle_advanced)
         advanced_row.addWidget(self.advanced_check); advanced_row.addStretch()
         settings.addWidget(self.settings_row)
@@ -1119,15 +1246,15 @@ class DownloaderWindow(QMainWindow):
         clip_grid.addLayout(clip_header,0,0)
         clip_row = QHBoxLayout(); clip_row.setSpacing(12)
         self.clip_start_entry = QLineEdit('00:00:00.000')
-        self.clip_start_entry.setAccessibleName('Début de l’extrait')
+        bind_text(self.clip_start_entry, 'setAccessibleName', 'Début de l’extrait')
         self.clip_start_entry.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.clip_start_entry.setFixedWidth(116)
-        self.clip_start_entry.setToolTip('Début — secondes ou HH:MM:SS.mmm')
+        bind_text(self.clip_start_entry, 'setToolTip', 'Début — secondes ou HH:MM:SS.mmm')
         self.clip_end_entry = QLineEdit('00:00:00.000')
-        self.clip_end_entry.setAccessibleName('Fin de l’extrait')
+        bind_text(self.clip_end_entry, 'setAccessibleName', 'Fin de l’extrait')
         self.clip_end_entry.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.clip_end_entry.setFixedWidth(116)
-        self.clip_end_entry.setToolTip('Fin — secondes ou HH:MM:SS.mmm')
+        bind_text(self.clip_end_entry, 'setToolTip', 'Fin — secondes ou HH:MM:SS.mmm')
         self.clip_slider = MediaRangeSlider()
         self.clip_slider.setRange(0, 0)
         self.clip_slider.setEnabled(False)
@@ -1144,7 +1271,7 @@ class DownloaderWindow(QMainWindow):
         self.clip_note_var.changed.connect(lambda text:self.clip_note_label.setVisible(bool(text)))
         clip_grid.addWidget(self.clip_note_label,2,0)
         advanced.addWidget(self.clip_frame,2,0,1,2)
-        self.codec_combo.setToolTip(self.format_help_var.get())
+        bind_text(self.codec_combo, 'setToolTip', self.format_help_var.get())
         self.format_help_var.changed.connect(self.codec_combo.setToolTip)
         settings.addWidget(self.advanced_panel)
         settings.addStretch()
@@ -1175,6 +1302,16 @@ class DownloaderWindow(QMainWindow):
         self.video_action_panel.setObjectName('videoActions')
         actions = self._layout(self.video_action_panel, QHBoxLayout, margins=16, spacing=10)
         actions.setContentsMargins(16, 8, 16, 8)
+        if self.list_view:
+            self.list_clip_dialog = QDialog(self)
+            bind_text(self.list_clip_dialog, 'setWindowTitle', 'Extrait du média')
+            self.list_clip_dialog.resize(650, 200)
+            clip_dialog_layout = self._layout(self.list_clip_dialog, margins=16)
+            clip_dialog_layout.addWidget(self.clip_frame)
+            clip_buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+            bind_text(clip_buttons.button(QDialogButtonBox.StandardButton.Close), 'setText', 'Fermer')
+            clip_buttons.rejected.connect(self.list_clip_dialog.reject)
+            clip_dialog_layout.addWidget(clip_buttons)
         self.size_label = self._label(self.size_var, name='size', wrap=True)
         actions.addWidget(self.size_label, 1)
         actions.addStretch()
@@ -1189,24 +1326,23 @@ class DownloaderWindow(QMainWindow):
 
         self.pause_download_button = self._button('', self._pause_download, 'pauseTransfer')
         self._size_download_action(self.pause_download_button, compact=True)
-        self.pause_download_button.setAccessibleName('Mettre le téléchargement en pause')
-        self.pause_download_button.setToolTip('Mettre en pause')
+        bind_text(self.pause_download_button, 'setAccessibleName', 'Mettre le téléchargement en pause')
+        bind_text(self.pause_download_button, 'setToolTip', 'Mettre en pause')
         self.pause_download_button.hide()
         self.cancel_button = self._button('Annuler', self._cancel_download, 'cancelTransfer')
-        self.cancel_button.setAccessibleName('Annuler le téléchargement en cours')
+        bind_text(self.cancel_button, 'setAccessibleName', 'Annuler le téléchargement en cours')
         self.cancel_button.setEnabled(False)
         self.cancel_button.hide()
-        self.open_download_button = QPushButton('Ouvrir')
+        self.open_download_button = ui(QPushButton(), text='Ouvrir')
         self.open_download_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DialogOpenButton))
         self.open_download_button.hide()
         self.download_result_menu = QMenu(self.open_download_button)
-        self.open_result_action = self.download_result_menu.addAction('Ouvrir le fichier',self._open_download_result)
-        self.reveal_result_action = self.download_result_menu.addAction('Afficher dans le dossier',self._reveal_download_result)
-        self.retry_subtitles_action = self.download_result_menu.addAction(
-            'Réessayer les sous-titres', self._retry_failed_subtitles)
+        self.open_result_action = add_translated(self.download_result_menu, 'addAction', 'Ouvrir le fichier', self._open_download_result)
+        self.reveal_result_action = add_translated(self.download_result_menu, 'addAction', 'Afficher dans le dossier', self._reveal_download_result)
+        self.retry_subtitles_action = add_translated(self.download_result_menu, 'addAction', 'Réessayer les sous-titres', self._retry_failed_subtitles)
         self.retry_subtitles_action.setVisible(False)
         self.download_result_menu.addSeparator()
-        self.download_result_menu.addAction('Télécharger à nouveau',self._download_again)
+        add_translated(self.download_result_menu, 'addAction', 'Télécharger à nouveau', self._download_again)
         self.open_download_button.setMenu(self.download_result_menu)
         self.transfer_panel = DownloadQueueRow()
         self.transfer_panel.setObjectName('activeDownload')
@@ -1215,11 +1351,11 @@ class DownloaderWindow(QMainWindow):
         self.transfer_title_label = self.transfer_panel.title
         self.resume_download_button = self._button(
             'Reprendre', self._resume_failed_download, 'primary')
-        self.resume_download_button.setAccessibleName('Reprendre le téléchargement interrompu')
+        bind_text(self.resume_download_button, 'setAccessibleName', 'Reprendre le téléchargement interrompu')
         self.skip_download_button = self._button(
             'Annuler', self._skip_failed_download, 'cancelPausedTransfer')
-        self.skip_download_button.setAccessibleName('Annuler le téléchargement interrompu')
-        self.skip_download_button.setToolTip('Annuler et passer au téléchargement suivant')
+        bind_text(self.skip_download_button, 'setAccessibleName', 'Annuler le téléchargement interrompu')
+        bind_text(self.skip_download_button, 'setToolTip', 'Annuler et passer au téléchargement suivant')
         self.resume_download_button.hide()
         self.skip_download_button.hide()
         for button in (self.resume_download_button, self.skip_download_button,
@@ -1239,57 +1375,74 @@ class DownloaderWindow(QMainWindow):
         self.download_panel = QFrame(); self.download_panel.setObjectName('footer')
         bottom = self._layout(self.download_panel, margins=16, spacing=8)
         bottom.setContentsMargins(16, 10, 16, 12)
-        rate_label = QLabel('Débit max')
+        rate_label = ui(QLabel(), text='Débit max')
         self.rate_limit_spinbox = RateSpinBox()
-        self.rate_limit_spinbox.setAccessibleName('Limite de téléchargement')
-        self.rate_limit_spinbox.setSpecialValueText('Illimité')
+        bind_text(self.rate_limit_spinbox, 'setAccessibleName', 'Limite de téléchargement')
+        bind_text(self.rate_limit_spinbox, 'setSpecialValueText', 'Illimité')
         self.rate_limit_spinbox.setKeyboardTracking(False)
         self.rate_limit_spinbox.setMinimumWidth(100)
         self.rate_unit_combo = ArrowCombo()
-        self.rate_unit_combo.setAccessibleName('Unité de la limite de téléchargement')
+        bind_text(self.rate_unit_combo, 'setAccessibleName', 'Unité de la limite de téléchargement')
         self.rate_unit_combo.addItems(RATE_UNITS)
         unit = str(self.preferences.value('download_rate_unit', 'Mbit/s'))
         self.rate_unit_combo.setCurrentText(unit if unit in RATE_UNITS else 'Mbit/s')
-        self._display_rate_limit(self.rate_unit_combo.currentText())
-        self.rate_limit_spinbox.setToolTip(
-            'Limite commune au téléchargement en cours et à toute la file. Validez avec Appliquer ou Entrée. 0 = aucune limite.')
+        self._display_rate_limit(self.rate_unit_combo.currentSourceText())
+        bind_text(self.rate_limit_spinbox, 'setToolTip', 'Limite commune au téléchargement en cours et à toute la file. Validez avec Appliquer ou Entrée. 0 = aucune limite.')
         self.apply_rate_button = self._button('Appliquer', self._apply_rate_limit, 'quiet')
-        self.apply_rate_button.setAccessibleName('Appliquer la limite à toute la file')
+        bind_text(self.apply_rate_button, 'setAccessibleName', 'Appliquer la limite à toute la file')
         self.unlimited_rate_button = self._button(
             'Illimité', lambda: self.rate_limit_spinbox.setValue(0), 'quiet')
-        self.unlimited_rate_button.setAccessibleName(
-            'Supprimer la limite de téléchargement')
-        self.unlimited_rate_button.setToolTip(
-            'Supprimer immédiatement la limite, même pendant un téléchargement.')
-        rate_row = QHBoxLayout()
-        rate_row.setSpacing(6)
-        rate_row.addWidget(self._label(text='Téléchargements', name='sectionTitle'))
-        rate_row.addStretch(1)
+        bind_text(self.unlimited_rate_button, 'setAccessibleName', 'Supprimer la limite de téléchargement')
+        bind_text(self.unlimited_rate_button, 'setToolTip', 'Supprimer immédiatement la limite, même pendant un téléchargement.')
+        if self.list_view:
+            rate_controls = QWidget()
+            rate_row = self._layout(rate_controls, QHBoxLayout, spacing=6)
+            rate_row.setContentsMargins(8, 0, 0, 0)
+            self.rate_limit_spinbox.setFixedWidth(90)
+            self.rate_unit_combo.setFixedWidth(116)
+        else:
+            rate_row = QHBoxLayout()
+            rate_row.setSpacing(6)
+            rate_row.addWidget(self._label(text='Téléchargements', name='sectionTitle'))
+            rate_row.addStretch(1)
         rate_row.addWidget(rate_label)
         rate_row.addWidget(self.rate_limit_spinbox)
         rate_row.addWidget(self.rate_unit_combo)
         rate_row.addWidget(self.apply_rate_button)
         rate_row.addWidget(self.unlimited_rate_button)
-        bottom.addLayout(rate_row)
+        if not self.list_view:
+            bottom.addLayout(rate_row)
 
         self.download_queue_panel = QFrame(); self.download_queue_panel.setObjectName('transferCard')
         scheduled = self._layout(self.download_queue_panel, margins=9, spacing=5)
         scheduled.addWidget(self.transfer_panel)
         self.download_queue_list = QListWidget()
         self.download_queue_list.setObjectName('scheduledDownloads')
-        self.download_queue_list.setAccessibleName('Téléchargements programmés dans l’ordre')
+        bind_text(self.download_queue_list, 'setAccessibleName', 'Téléchargements programmés dans l’ordre')
         self.download_queue_list.setResizeMode(QListWidget.ResizeMode.Adjust)
         self.download_queue_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.download_queue_list.verticalScrollBar().rangeChanged.connect(self._align_download_rows)
         for signal in (self.download_queue_list.itemClicked, self.download_queue_list.itemActivated):
             signal.connect(lambda item: self._open_download_tab(item.data(Qt.ItemDataRole.UserRole)))
+        self.download_queue_list.itemSelectionChanged.connect(self._highlight_transfer_row)
         scheduled.addWidget(self.download_queue_list)
         self.download_queue_empty_label = self._label(
             text='Aucun téléchargement programmé.', name='muted', wrap=True)
         scheduled.addWidget(self.download_queue_empty_label)
         bottom.addWidget(self.download_queue_panel)
-        outer.addWidget(self.download_panel)
-        self._render_scheduled_downloads()
+        self.shutdown_after_downloads_check = ui(QCheckBox(), text='Éteindre le PC à la fin' if self.list_view
+                                                      else 'Arrêter après la fin des téléchargements')
+        if self.list_view:
+            self.download_panel.setParent(self)
+            self.download_panel.hide()
+            bind_text(self.shutdown_after_downloads_check, 'setAccessibleName', 'Éteindre le PC à la fin des téléchargements')
+            bind_text(self.shutdown_after_downloads_check, 'setToolTip', 'Éteindre le PC après le dernier téléchargement réussi. Décompte annulable de 30 secondes.')
+            self.download_table.set_rate_controls(rate_controls, self.shutdown_after_downloads_check)
+            self.download_table.refresh([])
+        else:
+            bottom.addWidget(self.shutdown_after_downloads_check, alignment=Qt.AlignmentFlag.AlignLeft)
+            outer.addWidget(self.download_panel)
+            self._render_scheduled_downloads()
         self._apply_theme()
         self._align_download_rows()
         # Reserve enough room for every live status before the window is shown.
@@ -1305,9 +1458,9 @@ class DownloaderWindow(QMainWindow):
         )
         status_widths = []
         for status in index_statuses:
-            self.keyframe_index_button.setText(status)
+            bind_text(self.keyframe_index_button, 'setText', status)
             status_widths.append(self.keyframe_index_button.sizeHint().width())
-        self.keyframe_index_button.setText(original_text)
+        bind_text(self.keyframe_index_button, 'setText', original_text)
         self.keyframe_index_button.setFixedWidth(max(status_widths))
         QApplication.styleHints().colorSchemeChanged.connect(self._system_theme_changed)
 
@@ -1317,59 +1470,43 @@ class DownloaderWindow(QMainWindow):
 
     def _render_scheduled_downloads(self, selected_url=None):
         selected = selected_url or self._selected_scheduled_url()
+        if selected not in self.queued_downloads:
+            selected = next(iter(self.queued_downloads), None)
         items = self.download_queue_list
         items.blockSignals(True)
-        items.clear()
-        count = len(self.queued_downloads)
-        for position, (url, job) in enumerate(self.queued_downloads.items(), 1):
-            title = job['title'] or self._compact_queue_url(url)
-            summary = self._queued_download_summary(job)
-            video_id = str((job.get('data') or {}).get('id') or youtube_video_id(url))
-            row = DownloadQueueRow(title)
-            row.thumbnail.setPixmap(self._thumbnail_pixmap(
-                self.thumbnail_cache.get(video_id), row.thumbnail.size()))
-            if 'progress' in job:
-                row.status.addWidget(QueueLabel('En pause', 'fieldLabel'))
-                progress = job['progress']
-                bar = Progress()
-                if isinstance(progress, (int, float)) and 0 <= progress <= 100:
-                    bar.configure(value=progress)
-                row.status.addWidget(bar)
+        existing = {}
+        for index in range(items.count() - 1, -1, -1):
+            item = items.item(index)
+            url = item.data(Qt.ItemDataRole.UserRole)
+            row = items.itemWidget(item)
+            if self.queued_downloads.get(url) is row.job:
+                existing[url] = item
             else:
-                row.status.addWidget(QueueLabel('En attente', 'fieldLabel'))
-                row.status.addWidget(QueueLabel(summary, 'muted'))
-            row.up_button = self._button(
-                '↑', lambda checked=False, url=url: self._move_scheduled_download(url, -1), 'queueArrow')
-            row.down_button = self._button(
-                '↓', lambda checked=False, url=url: self._move_scheduled_download(url, 1), 'queueArrow')
-            for button, label, enabled in (
-                (row.up_button, 'Monter', position > 1 or self._can_prioritize_download()),
-                (row.down_button, 'Descendre', position < count),
-            ):
-                button.setAccessibleName(label)
-                button.setToolTip(label)
-                button.setFixedHeight(19)
-                button.setEnabled(enabled)
-                row.order.addWidget(button)
-            row.remove_button = self._button(
-                'Retirer', lambda checked=False, url=url: self._remove_scheduled_download(url), 'queueAction')
-            self._size_download_action(row.remove_button)
-            row.actions.addWidget(row.remove_button)
-            item = QListWidgetItem()
-            item.setSizeHint(QSize(0, row.minimumHeight()))
-            item.setData(Qt.ItemDataRole.UserRole, url)
-            item.setData(DOWNLOAD_VIDEO_ID_ROLE, video_id)
-            item.setData(Qt.ItemDataRole.AccessibleTextRole, f'{position}. {title} · {summary}')
-            tooltip = f'{title}\n{summary}\nDossier : {job["request"][1]}\n{url}'
-            item.setToolTip(tooltip)
-            row.setToolTip(tooltip)
-            items.addItem(item)
-            items.setItemWidget(item, row)
+                items.takeItem(index)
+        count = len(self.queued_downloads)
+        can_prioritize = self._can_prioritize_download()
+        for position, (url, job) in enumerate(self.queued_downloads.items(), 1):
+            item = existing.get(url)
+            target = position - 1
+            if item is None:
+                item = self._insert_scheduled_download(target, url, job)
+            else:
+                source = items.row(item)
+                # Every earlier position has already been placed.
+                if source > target:
+                    model = items.model()
+                    root = items.rootIndex()
+                    model.moveRow(root, source, root, target)
+            row = items.itemWidget(item)
+            row.up_button.setEnabled(position > 1 or can_prioritize)
+            row.down_button.setEnabled(position < count)
+            item.setData(Qt.ItemDataRole.AccessibleTextRole, f'{position}. {row.description}')
             if url == selected:
                 items.setCurrentItem(item)
-        if items.count() and items.currentRow() < 0:
-            items.setCurrentRow(0)
+        if self._transfer_busy() and self._viewing_transfer():
+            items.clearSelection()
         items.blockSignals(False)
+        self._highlight_transfer_row()
         items.setVisible(bool(count))
         self._fit_download_queue_height()
         if selected_url and items.currentItem():
@@ -1378,13 +1515,80 @@ class DownloaderWindow(QMainWindow):
         if not self.transfer_panel.isHidden():
             self._set_transfer_thumbnail(self.thumbnail_cache.get(self._transfer_video_id()))
 
+    def _insert_scheduled_download(self, index, url, job):
+        title = job['title'] or self._compact_queue_url(url)
+        summary = self._queued_download_summary(job)
+        video_id = str((job.get('data') or {}).get('id') or youtube_video_id(url))
+        row = DownloadQueueRow(title)
+        row.job = job
+        row.description = f'{title} · {summary}'
+        self._set_thumbnail(row.thumbnail, self.thumbnail_cache.get(video_id))
+        if 'progress' in job:
+            row.status.addWidget(ui(QueueLabel(name='fieldLabel'), text='En pause'))
+            progress = job['progress']
+            bar = Progress()
+            if isinstance(progress, (int, float)) and 0 <= progress <= 100:
+                bar.configure(value=progress)
+            row.status.addWidget(bar)
+        else:
+            row.status.addWidget(ui(QueueLabel(name='fieldLabel'), text='En attente'))
+            row.status.addWidget(ui(QueueLabel(name='muted'), text=summary))
+        for text, label, delta in (('↑', 'Monter', -1), ('↓', 'Descendre', 1)):
+            button = self._button(
+                text, lambda checked=False, delta=delta: self._move_scheduled_download(url, delta), 'queueArrow')
+            bind_text(button, 'setAccessibleName', label)
+            bind_text(button, 'setToolTip', label)
+            button.setFixedHeight(19)
+            row.order.addWidget(button)
+            if delta < 0:
+                row.up_button = button
+            else:
+                row.down_button = button
+        row.remove_button = self._button(
+            'Retirer', lambda checked=False: self._remove_scheduled_download(url), 'queueAction')
+        self._size_download_action(row.remove_button)
+        row.actions.addWidget(row.remove_button)
+        item = QListWidgetItem()
+        item.setSizeHint(QSize(0, row.minimumHeight()))
+        item.setData(Qt.ItemDataRole.UserRole, url)
+        item.setData(DOWNLOAD_VIDEO_ID_ROLE, video_id)
+        tooltip = message('%1\n%2\n%3\n%4', title, message(summary),
+                          message('Dossier : %1', job['request'][1]), url)
+        bind_text(item, 'setToolTip', tooltip)
+        bind_text(row, 'setToolTip', tooltip)
+        self.download_queue_list.insertItem(index, item)
+        self.download_queue_list.setItemWidget(item, row)
+        return item
+
+    def _highlight_transfer_row(self):
+        selected = (self._transfer_busy() and self._viewing_transfer()
+                    and not self.download_queue_list.selectedItems())
+        row = self.transfer_panel
+        if row.property('selected') != selected:
+            row.setProperty('selected', selected)
+            row.style().unpolish(row)
+            row.style().polish(row)
+            row.update()
+
     def _fit_download_queue_height(self):
         items = self.download_queue_list
         if items.count():
             row_height = items.sizeHintForRow(0)
             # Keep the video settings usable when the window is at its minimum height.
             visible_rows = 2 if self.height() >= self.minimumHeight() + row_height else 1
-            items.setFixedHeight(min(items.count(), visible_rows) * row_height)
+            height = min(items.count(), visible_rows) * row_height
+            if items.minimumHeight() != height or items.maximumHeight() != height:
+                items.setFixedHeight(height)
+                # Propagate the new minimum through the footer before the next
+                # paint, including when the selected-video banner also resizes.
+                for widget in (self.download_queue_panel, self.download_panel, self.centralWidget()):
+                    widget.layout().invalidate()
+                    widget.updateGeometry()
+                self.layout().invalidate()
+                self.layout().activate()
+                self.centralWidget().layout().activate()
+                self.download_panel.layout().activate()
+                self.download_queue_panel.layout().activate()
 
     def _align_download_rows(self, *_):
         items = self.download_queue_list
@@ -1395,6 +1599,10 @@ class DownloaderWindow(QMainWindow):
 
     def _update_transfer_visibility(self, *_):
         busy = self._transfer_busy()
+        if self.list_view:
+            self.open_download_button.setVisible(busy and bool(self.download_result_folder) and self.download_thread is None)
+            self._update_download_tooltip()
+            return
         visible = bool(busy or self.progress_text_var.get())
         self.transfer_panel.setVisible(visible)
         self.download_progress.setVisible(busy or self.download_progress.value() > 0)
@@ -1408,7 +1616,7 @@ class DownloaderWindow(QMainWindow):
             state = '' if self.download_retry_pending else self.progress_text_var.get() or 'En cours'
             self.transfer_title_label.setText(title)
             self.transfer_title_label.setToolTip(title)
-            self.transfer_status_label.setText(state)
+            bind_text(self.transfer_status_label, 'setText', state)
             self._update_download_tooltip()
         count = self.download_queue_list.count()
         self.download_queue_empty_label.setVisible(not count and not visible)
@@ -1418,8 +1626,7 @@ class DownloaderWindow(QMainWindow):
         return str((self.active_download_data or {}).get('id') or youtube_video_id(url))
 
     def _set_transfer_thumbnail(self, content):
-        label = self.transfer_thumbnail_label
-        label.setPixmap(self._thumbnail_pixmap(content, label.size()))
+        self._set_thumbnail(self.transfer_thumbnail_label, content)
 
     def _update_download_queue_thumbnail(self, video_id, content):
         if video_id == self._transfer_video_id():
@@ -1429,20 +1636,28 @@ class DownloaderWindow(QMainWindow):
             item = items.item(index)
             if item.data(DOWNLOAD_VIDEO_ID_ROLE) == video_id:
                 thumbnail = items.itemWidget(item).thumbnail
-                thumbnail.setPixmap(self._thumbnail_pixmap(content, thumbnail.size()))
+                self._set_thumbnail(thumbnail, content)
 
     def _update_download_tooltip(self, *_):
         lines = self.progress_detail_var.get().splitlines()[-8:]
-        state = self.transfer_status_label.text()
+        state = self.progress_text_var.get() if self.list_view else self.transfer_status_label.text()
         if state:
             lines.insert(0, state)
         tooltip = '<qt>' + '<br>'.join(escape(line) for line in lines) + '</qt>' if lines else ''
-        self.download_progress.setToolTip(tooltip)
-        self.transfer_status_label.setToolTip(tooltip)
+        if self.list_view:
+            row = self.download_table.rows.get(self.active_queue_url)
+            if row and self.active_download_job:
+                bind_text(row, 'setToolTip', 4, tooltip)
+            return
+        bind_text(self.download_progress, 'setToolTip', tooltip)
+        bind_text(self.transfer_status_label, 'setToolTip', tooltip)
 
     def eventFilter(self, watched, event):
-        if isinstance(watched, QWidget) and watched.window() is self:
-            if event.type() in (QEvent.Type.DragEnter, QEvent.Type.DragMove, QEvent.Type.Drop):
+        event_type = event.type()
+        drag_events = (QEvent.Type.DragEnter, QEvent.Type.DragMove, QEvent.Type.Drop)
+        if (event_type in (*drag_events, QEvent.Type.KeyPress)
+                and isinstance(watched, QWidget) and watched.window() is self):
+            if event_type in drag_events:
                 mime = event.mimeData()
                 partials = [item.toLocalFile() for item in mime.urls()
                             if item.isLocalFile() and item.toLocalFile().lower().endswith('.part')]
@@ -1458,14 +1673,13 @@ class DownloaderWindow(QMainWindow):
                         self._url_link_submitted(url)
                     event.acceptProposedAction()
                     return True
-            elif (event.type() == QEvent.Type.KeyPress
-                    and not isinstance(watched, (QLineEdit, QPlainTextEdit, QAbstractSpinBox))
+            elif (not isinstance(watched, (QLineEdit, QPlainTextEdit, QAbstractSpinBox))
                     and event.matches(QKeySequence.StandardKey.Paste)):
                 if self._paste_video_link():
                     event.accept()
                     return True
-        if hasattr(self, 'scroll_area') and watched is self.scroll_area.viewport() and event.type() in (
-                QEvent.Type.Resize, QEvent.Type.Show):
+        if (event_type in (QEvent.Type.Resize, QEvent.Type.Show) and hasattr(self, 'scroll_area')
+                and watched is self.scroll_area.viewport()):
             self.after_idle(self._update_scroll_cue)
         return super().eventFilter(watched, event)
 
@@ -1488,23 +1702,20 @@ class DownloaderWindow(QMainWindow):
         self._apply_theme()
 
     def _system_theme_changed(self, *_):
-        if not self._disposed and (self.theme_value == 'Système' or self._extended_title_bar):
+        if not self._disposed and self.theme_value == 'Système':
             self._apply_theme()
 
     def _apply_theme(self):
         system_dark = QApplication.styleHints().colorScheme() == Qt.ColorScheme.Dark
         dark = self.theme_value == 'Sombre' or (self.theme_value == 'Système' and system_dark)
         bg, surface, ink, muted, line, accent, tint = ('#16191f','#20252d','#edf1f7','#a9b5c6','#394351','#90b4ff','#293c5c') if dark else ('#f6f8fb','#ffffff','#202b3a','#58677b','#dce3ed','#2563cf','#edf3ff')
-        title_bg, title_ink, title_hover = surface, ink, tint
-        if self._extended_title_bar:
-            # Qt draws the caption glyphs using the Windows theme.
-            title_bg, title_ink, title_hover = ('#1f1f1f', '#fffffd', '#414141') if system_dark else ('#f3f3f3', '#161616', '#dedede')
         palette = QPalette()
         for role,color in [(QPalette.ColorRole.Window,bg),(QPalette.ColorRole.WindowText,ink),(QPalette.ColorRole.Base,surface),(QPalette.ColorRole.AlternateBase,bg),(QPalette.ColorRole.Text,ink),(QPalette.ColorRole.Button,surface),(QPalette.ColorRole.ButtonText,ink),(QPalette.ColorRole.Highlight,accent),(QPalette.ColorRole.HighlightedText,'#14233a' if dark else '#ffffff'),(QPalette.ColorRole.ToolTipBase,surface),(QPalette.ColorRole.ToolTipText,ink)]:palette.setColor(role,QColor(color))
+        palette.setColor(QPalette.ColorRole.Link, QColor(accent))
         self.setPalette(palette)
         icon = QPixmap(20,20); icon.fill(Qt.GlobalColor.transparent)
         painter = QPainter(icon); painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.setPen(QPen(QColor(title_ink),1.6))
+        painter.setPen(QPen(QColor(ink),1.6))
         for y in (5,10,15):painter.drawLine(3,y,17,y)
         painter.end(); self.options_button.setIcon(QIcon(icon))
         pause_icon = QPixmap(16, 16)
@@ -1517,8 +1728,6 @@ class DownloaderWindow(QMainWindow):
         self.setStyleSheet(f'''
             QWidget {{font-family:'Segoe UI';font-size:13px;color:{ink};}}
             QMainWindow, QWidget#content {{background:{bg};}}
-            QFrame#titleBar {{background:{title_bg};}}
-            QLabel#windowCaption {{color:{title_ink};font-size:13px;font-weight:500;}}
             QFrame#videoActions {{background:{bg};border-top:1px solid {line};}}
             QFrame#sourcePanel, QFrame#footer {{background:{surface};border:0;}}
             QFrame#sourcePanel {{border-bottom:1px solid {line};}}
@@ -1545,8 +1754,11 @@ class DownloaderWindow(QMainWindow):
             QComboBox QAbstractItemView {{background:{surface};color:{ink};selection-background-color:{tint};selection-color:{ink};border:1px solid {line};outline:0;}}
             QComboBox QAbstractItemView::item {{min-height:28px;padding:3px 8px;}}
             QTabBar#videoTabs {{background:transparent;}}
-            QTabBar#videoTabs::tab {{background:{surface};border:1px solid {line};border-bottom:2px solid {line};border-radius:8px;padding:6px 10px 6px 8px;margin-right:6px;}}
-            QTabBar#videoTabs::tab:selected {{background:{tint};border-bottom-color:{accent};}}
+            QTabBar#videoTabs::tab {{background:{surface};border:2px solid {line};border-bottom:4px solid {line};border-radius:8px;padding:6px 10px 6px 8px;margin-right:6px;}}
+            QTabBar#videoTabs::tab:selected {{background:{tint};border-color:{accent};}}
+            QFrame#selectedVideo {{background:{bg};border:0;border-left:4px solid {accent};border-bottom:1px solid {line};}}
+            QLabel#selectedVideoHeading {{color:{accent};font-size:12px;font-weight:600;}}
+            QLabel#selectedVideoTitle {{font-size:16px;font-weight:600;}}
             QFrame#videoTabLeftFade {{background:qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 {surface},stop:0.15 {surface},stop:1 transparent);border:0;}}
             QFrame#videoTabRightFade {{background:qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 transparent,stop:0.85 {surface},stop:1 {surface});border:0;}}
             QPushButton#videoTabClose {{background:{bg};color:{muted};border:1px solid {line};border-radius:4px;padding:0;min-height:0;font-size:15px;}}
@@ -1557,16 +1769,28 @@ class DownloaderWindow(QMainWindow):
             QLabel#tabTitle {{font-size:15px;font-weight:600;}}
             QLabel#tabState {{font-size:12px;color:{muted};}}
             QFrame#activeDownload {{background:{surface};border-radius:7px;}}
+            QFrame#activeDownload[selected="true"] {{background:{tint};}}
             QListWidget#scheduledDownloads {{background:{surface};border:0;outline:0;}}
             QListWidget#scheduledDownloads::item {{border-bottom:1px solid {line};}}
             QListWidget#scheduledDownloads::item:selected {{background:{tint};color:{ink};}}
+            QTreeWidget#videoList {{background:{surface};alternate-background-color:{bg};border:1px solid {line};border-radius:6px;selection-background-color:{tint};selection-color:{ink};}}
+            QTreeWidget#videoList::item {{min-height:29px;border-bottom:1px solid {line};padding:1px 4px;}}
+            QTreeWidget#videoList::item:selected {{background:{tint};color:{ink};}}
+            QTreeWidget#videoList::indicator:unchecked {{background:{surface};border:1px solid {muted};border-radius:3px;}}
+            QTreeWidget#videoList QHeaderView::section {{border-right:1px solid {line};}}
+            QFrame#streamChoices {{background:{surface};border:1px solid {line};border-radius:7px;}}
+            QListWidget#defaultSubtitleLanguages {{background:{surface};alternate-background-color:{bg};border:1px solid {line};}}
+            QListWidget#defaultSubtitleLanguages::item {{min-height:22px;padding:2px 4px;}}
+            QListWidget#defaultSubtitleLanguages::item:selected {{background:{tint};color:{ink};}}
+            QFrame#downloadTable {{background:{bg};}}
+            QPlainTextEdit#selectedVideoDescription {{background:{surface};border:1px solid {line};padding:6px;}}
             QPushButton {{background:{surface};border:1px solid {line};border-radius:7px;padding:9px 14px;min-height:19px;}}
             QPushButton:hover {{background:{tint};border-color:{accent};}}
             QPushButton#addVideo {{background:{tint};color:{accent};border-color:{line};padding:0;font-size:32px;font-weight:500;}}
             QPushButton#addVideo:hover, QPushButton#addVideo:focus {{border-color:{accent};}}
             QPushButton#optionsButton {{background:transparent;border:1px solid transparent;border-radius:4px;padding:0;min-height:0;}}
-            QPushButton#optionsButton:hover {{background:{title_hover};border-color:transparent;}}
-            QPushButton#optionsButton:focus {{border-color:{title_ink};}}
+            QPushButton#optionsButton:hover {{background:{tint};border-color:transparent;}}
+            QPushButton#optionsButton:focus {{border-color:{ink};}}
             QMenu {{background:{surface};color:{ink};border:1px solid {line};padding:5px;}}
             QMenu::item {{padding:7px 28px 7px 20px;border-radius:4px;}}
             QMenu::item:selected {{background:{tint};}}
@@ -1642,7 +1866,7 @@ class DownloaderWindow(QMainWindow):
         self.container_frame.setVisible(advanced and mode != 'subtitles')
         self.video_codec_frame.setVisible(video and advanced)
         self.audio_frame.setVisible(audio and advanced)
-        self.clip_frame.setVisible(advanced and mode != 'subtitles')
+        self.clip_frame.setVisible(self.list_view or (advanced and mode != 'subtitles'))
         self._update_auto_summary()
         self.auto_summary_label.setVisible(bool(self.auto_summary_var.get()))
         self._mark_mode(mode)
@@ -1653,9 +1877,13 @@ class DownloaderWindow(QMainWindow):
 
     def _bind_events(self):
         self.rate_limit_spinbox.valueChanged.connect(self._rate_limit_changed)
-        self.rate_unit_combo.currentTextChanged.connect(self._rate_unit_changed)
+        self.rate_unit_combo.currentIndexChanged.connect(
+            lambda _index: self._rate_unit_changed(self.rate_unit_combo.currentSourceText()))
         self.url_var.changed.connect(self._on_url_changed)
-        self.container_combo.activated.connect(lambda _:self._refresh_resolution_choices())
+        if self.list_view:
+            self.container_combo.activated.connect(self._list_set_container)
+        else:
+            self.container_combo.activated.connect(lambda _:self._refresh_resolution_choices())
         self.resolution_combo.activated.connect(lambda _:self._update_download_button_state())
         self.audio_combo.activated.connect(lambda _:self._audio_changed())
         for combo in (self.audio_codec_combo,self.audio_rate_combo):
@@ -1689,12 +1917,12 @@ class DownloaderWindow(QMainWindow):
         return True
 
     def _request_new_link(self):
-        return QInputDialog.getText(self, 'Ajouter une vidéo', 'Lien YouTube')
+        return QInputDialog.getText(self, tr('Ajouter une vidéo'), tr('Lien YouTube'))
 
     def _request_partial_link(self, filename, suggested_url):
         return QInputDialog.getText(
-            self, 'Reprendre un fichier partiel',
-            f'{filename}\nCollez le lien YouTube d’origine pour identifier le flux :',
+            self, tr('Reprendre un fichier partiel'),
+            filename + '\n' + tr('Collez le lien YouTube d’origine pour identifier le flux :'),
             text=suggested_url)
 
     def _set_analysis_indicator(self, active):
@@ -1709,19 +1937,44 @@ class DownloaderWindow(QMainWindow):
         self.queued_video_panel.setVisible(show_summary)
         active = self._analysis_indicator_active
         ready = not active and self.analysis_data is not None
+        if self.list_view:
+            self.queued_video_panel.hide()
+            self.video_settings_panel.hide()
+            self.analysis_panel.setVisible(active and not show_summary)
+            self.analysis_result_panel.setVisible(not active and not show_summary)
+            self._update_list_details()
+            return
         self.analysis_panel.setVisible(active and not show_summary)
         self.analysis_result_panel.setVisible(not active and not show_summary)
         self.video_settings_panel.setVisible(ready and not show_summary)
         self.video_action_panel.setVisible(ready and not show_summary)
         if show_summary:
-            self.queued_video_summary.setText(self._queued_download_summary(job, detailed=True))
+            bind_text(self.queued_video_summary, 'setText', self._queued_download_summary(job, detailed=True))
             self.edit_queued_video_button.setVisible(
                 active_job is None and ready and not job.get('partial_path'))
 
     def _show_analysis_status(self, text):
-        self.status_label.setText(text)
+        bind_text(self.status_label, 'setText', text)
         self.status_label.setVisible(
             bool(text) and text != 'Analyse terminée' and not text.startswith('En direct · '))
+        if self.list_view and hasattr(self, 'list_clip_dialog'):
+            self._update_list_details()
+
+    def _update_list_details(self):
+        show_status = (self._analysis_indicator_active or not self.status_label.isHidden()
+                       or not self.analysis_retry_button.isHidden() or not self.verification_button.isHidden())
+        self.scroll_area.setVisible(not self.completed_selection and show_status)
+
+    def _open_list_clip(self):
+        url = self.queue_view_url
+        if not self._list_start_editing(url):
+            return
+        self.settings_var.set('manual')
+        self._apply_settings_layout()
+        self._update_clip_index_controls()
+        self.list_clip_dialog.exec()
+        if url == self.queue_view_url:
+            self._save_download_checkpoint()
 
     def _thumbnail_pixmap(self, content, size):
         image = QPixmap()
@@ -1731,20 +1984,105 @@ class DownloaderWindow(QMainWindow):
         width = min(28, size.height())
         return self.windowIcon().pixmap(width, width)
 
+    def _set_thumbnail(self, label, content):
+        if getattr(label, '_thumbnail_content', False) is content:
+            return
+        label.setPixmap(self._thumbnail_pixmap(content, label.size()))
+        label._thumbnail_content = content
+
+    def _set_selected_video_identity(self, url, title, state, data, content, *, placeholder=False):
+        self.selected_video_panel.setVisible(bool(url))
+        self.selected_video_panel.setProperty('videoUrl', url)
+        bind_text(self.selected_video_heading, 'setText', 'Vidéo sélectionnée · ' + state if state else 'Vidéo sélectionnée')
+        if placeholder:
+            bind_text(self.selected_video_title, 'setText', title if url else '')
+            bind_text(self.selected_video_title, 'setToolTip', title)
+        else:
+            unbind_text(self.selected_video_title, 'setText')
+            unbind_text(self.selected_video_title, 'setToolTip')
+            self.selected_video_title.setText(title if url else '')
+            self.selected_video_title.setToolTip(title)
+        bind_text(self.selected_video_title, 'setAccessibleName', 'Titre de la vidéo sélectionnée')
+        video_id = youtube_video_id(url)
+        link = 'https://youtu.be/' + video_id if video_id else url
+        if self.list_view and is_youtube_url(link):
+            target = escape(link, quote=True)
+            self.selected_video_url.setTextFormat(Qt.TextFormat.RichText)
+            self.selected_video_url.setText(f'<a href="{target}">{target}</a>')
+        else:
+            self.selected_video_url.setTextFormat(Qt.TextFormat.PlainText)
+            self.selected_video_url.setText(link)
+        self.selected_video_url.setToolTip(url)
+        details = [str(data.get('channel') or data.get('uploader') or '').strip()]
+        duration = data.get('duration')
+        if isinstance(duration, (int, float)) and duration > 0:
+            minutes, seconds = divmod(int(duration), 60)
+            hours, minutes = divmod(minutes, 60)
+            details.append(f'{hours}:{minutes:02}:{seconds:02}' if hours else f'{minutes}:{seconds:02}')
+        self.selected_video_meta.setText(' · '.join(value for value in details if value))
+        if self.list_view:
+            self.selected_video_thumbnail.set_content(content)
+            description = data.get('description')
+            text = description.strip() if isinstance(description, str) else ''
+            if data and not text:
+                text = ('Description indisponible. Relancez l’analyse pour la récupérer.'
+                        if 'description' not in data and not self.completed_selection
+                        else 'Aucune description disponible.')
+            widget = self.selected_video_description
+            if getattr(self, '_video_description_url', None) != url or getattr(self, '_video_description_text', None) != text:
+                if description:
+                    unbind_text(widget, 'setPlainText')
+                    widget.setPlainText(text)
+                else:
+                    bind_text(widget, 'setPlainText', text)
+                self._video_description_url, self._video_description_text = url, text
+            widget.setVisible(bool(url and text))
+        else:
+            self._set_thumbnail(self.selected_video_thumbnail, content)
+        self.selected_video_panel.setToolTip('\n'.join((title, self.selected_video_meta.text(), url)))
+        self._update_selected_video_layout()
+
+    @staticmethod
+    def _open_video_link(link):
+        if is_youtube_url(link):
+            QDesktopServices.openUrl(QUrl(link))
+
+    def _update_selected_video_layout(self):
+        if self.list_view:
+            self.selected_video_meta.setVisible(bool(self.selected_video_meta.text()))
+            return
+        compact = self.height() < self.minimumHeight() + 200
+        self.selected_video_meta.setVisible(not compact and bool(self.selected_video_meta.text()))
+        self.selected_video_url.setVisible(not compact)
+        if compact == getattr(self, '_selected_video_compact', None):
+            return
+        self._selected_video_compact = compact
+        self.selected_video_panel.layout().setContentsMargins(*(12, 7, 12, 7) if compact else (14, 14, 14, 14))
+        self.selected_video_title.setMaximumHeight(
+            2 * self.selected_video_title.fontMetrics().lineSpacing() if compact else 16777215)
+        thumbnail = self.selected_video_thumbnail
+        content = getattr(thumbnail, '_thumbnail_content', None)
+        thumbnail.setFixedSize(64, 36) if compact else thumbnail.setFixedSize(96, 54)
+        thumbnail._thumbnail_content = False
+        self._set_thumbnail(thumbnail, content)
+
     def _set_video_tab_preview(self, index, title, state, content, *, analyzing, downloading):
         side = QTabBar.ButtonPosition.LeftSide
         preview = self.queue_tabs.tabButton(index, side)
         if preview is None:
             preview = VideoTabPreview()
             self.queue_tabs.setTabButton(index, side, preview)
-        preview.set_title(title)
-        preview.state.setText(state)
-        preview.state.setVisible(not downloading)
-        preview.spinner.setVisible(analyzing)
-        preview.download_progress.setVisible(downloading)
+        appearance = (title, state, analyzing, downloading)
+        if getattr(preview, '_appearance', None) != appearance:
+            preview.set_title(title)
+            bind_text(preview.state, 'setText', state)
+            preview.state.setVisible(not downloading)
+            preview.spinner.setVisible(analyzing)
+            preview.download_progress.setVisible(downloading)
+            preview._appearance = appearance
         if downloading:
             self._update_tab_download_progress(index)
-        preview.thumbnail.setPixmap(self._thumbnail_pixmap(content, preview.thumbnail.size()))
+        self._set_thumbnail(preview.thumbnail, content)
 
     def _add_video_tab_close(self, index, url):
         holder = QWidget()
@@ -1752,8 +2090,8 @@ class DownloaderWindow(QMainWindow):
         layout = self._layout(holder, spacing=0)
         button = self._button('×', lambda: self._close_video_tab(url), 'videoTabClose')
         button.setFixedSize(18, 18)
-        button.setAccessibleName('Fermer l’onglet')
-        button.setToolTip('Fermer l’onglet')
+        bind_text(button, 'setAccessibleName', 'Fermer l’onglet')
+        bind_text(button, 'setToolTip', 'Fermer l’onglet')
         layout.addWidget(button, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop)
         layout.addStretch()
         self.queue_tabs.setTabButton(index, self.queue_tabs.ButtonPosition.RightSide, holder)
@@ -1786,13 +2124,13 @@ class DownloaderWindow(QMainWindow):
         if not self._transfer_busy():
             self.download_results = []
             self.download_result_folder = ''
-        self.download_button.setText('Télécharger')
+        bind_text(self.download_button, 'setText', 'Télécharger')
         self._update_transfer_visibility()
 
     def _request_download_folder(self):
         url = self.url_var.get().strip()
         folder = QFileDialog.getExistingDirectory(
-            self, 'Choisir le dossier de téléchargement', self.folder_var.get())
+            self, tr('Choisir le dossier de téléchargement'), self.folder_var.get())
         if folder:
             if self.url_var.get().strip() == url:
                 self.folder_var.set(folder)
@@ -1802,13 +2140,12 @@ class DownloaderWindow(QMainWindow):
     def _ask_download_verification(self):
         dialog = QMessageBox(self)
         dialog.setIcon(QMessageBox.Icon.Warning)
-        dialog.setWindowTitle('Vérification YouTube requise')
-        dialog.setText('YouTube a refusé l’accès nécessaire.')
-        dialog.setInformativeText(
-            'Ouvrir maintenant la vérification Google ? Une fois le contrôle terminé, '
+        bind_text(dialog, 'setWindowTitle', 'Vérification YouTube requise')
+        bind_text(dialog, 'setText', 'YouTube a refusé l’accès nécessaire.')
+        bind_text(dialog, 'setInformativeText', 'Ouvrir maintenant la vérification Google ? Une fois le contrôle terminé, '
             'la même opération reprendra automatiquement.')
-        verify = dialog.addButton('Vérifier maintenant', QMessageBox.ButtonRole.AcceptRole)
-        dialog.addButton('Plus tard', QMessageBox.ButtonRole.RejectRole)
+        verify = add_translated(dialog, 'addButton', 'Vérifier maintenant', QMessageBox.ButtonRole.AcceptRole)
+        add_translated(dialog, 'addButton', 'Plus tard', QMessageBox.ButtonRole.RejectRole)
         dialog.setDefaultButton(verify)
         dialog.exec()
         return dialog.clickedButton() is verify
@@ -1827,9 +2164,8 @@ class DownloaderWindow(QMainWindow):
         dialog = QMessageBox(self)
         dialog.setIcon(QMessageBox.Icon.Warning)
         if completed_languages:
-            dialog.setWindowTitle('Sous-titres partiellement téléchargés')
-            dialog.setText(
-                'Certaines langues de sous-titres ont été téléchargées, mais d’autres manquent.')
+            bind_text(dialog, 'setWindowTitle', 'Sous-titres partiellement téléchargés')
+            bind_text(dialog, 'setText', 'Certaines langues de sous-titres ont été téléchargées, mais d’autres manquent.')
             obtained = '\n'.join(
                 '• ' + label
                 for label in self._subtitle_language_labels(completed_languages))
@@ -1841,9 +2177,8 @@ class DownloaderWindow(QMainWindow):
                 detail += '\n\nLangues à réessayer :\n' + missing
             detail += '\n\nRéessayer uniquement les langues manquantes ?'
         else:
-            dialog.setWindowTitle('Sous-titres non téléchargés')
-            dialog.setText(
-                'La vidéo a été téléchargée, mais aucun fichier de sous-titres n’a été obtenu.')
+            bind_text(dialog, 'setWindowTitle', 'Sous-titres non téléchargés')
+            bind_text(dialog, 'setText', 'La vidéo a été téléchargée, mais aucun fichier de sous-titres n’a été obtenu.')
             detail = 'Réessayer uniquement les sous-titres ?'
         if clip:
             detail += (
@@ -1851,16 +2186,15 @@ class DownloaderWindow(QMainWindow):
                 'et recalés sur l’extrait.')
         if error:
             detail += '\n\n' + str(error)
-        dialog.setInformativeText(detail)
-        retry = dialog.addButton(
-            'Réessayer les sous-titres', QMessageBox.ButtonRole.AcceptRole)
-        dialog.addButton('Plus tard', QMessageBox.ButtonRole.RejectRole)
+        bind_text(dialog, 'setInformativeText', detail)
+        retry = add_translated(dialog, 'addButton', 'Réessayer les sous-titres', QMessageBox.ButtonRole.AcceptRole)
+        add_translated(dialog, 'addButton', 'Plus tard', QMessageBox.ButtonRole.RejectRole)
         dialog.setDefaultButton(retry)
         dialog.exec()
         return dialog.clickedButton() is retry
 
     def _show_diagnostic(self):
-        dialog = QDialog(self); dialog.setWindowTitle('Diagnostic YouTube'); dialog.resize(760,510)
+        dialog = QDialog(self); bind_text(dialog, 'setWindowTitle', 'Diagnostic YouTube'); dialog.resize(760,510)
         layout = self._layout(dialog,margins=18)
         text = QPlainTextEdit(self._diagnostic_text()); text.setReadOnly(True); layout.addWidget(text)
         row = QHBoxLayout(); row.addStretch()
@@ -1872,7 +2206,7 @@ class DownloaderWindow(QMainWindow):
         if self.dependency_dialog is not None:
             self.dependency_dialog.show(); self.dependency_dialog.raise_(); self.dependency_dialog.activateWindow(); return
         dialog = self.dependency_dialog = QDialog(self)
-        dialog.setWindowTitle('Composants requis'); dialog.resize(840,500)
+        bind_text(dialog, 'setWindowTitle', 'Composants requis'); dialog.resize(840,500)
         frame = self._layout(dialog,margins=18)
         self.dependency_alert_label = self._label(
             text='Des composants indispensables manquent. Installez-les pour continuer.',
@@ -1880,7 +2214,7 @@ class DownloaderWindow(QMainWindow):
         frame.addWidget(self.dependency_alert_label)
         frame.addWidget(self._label(text='Composants du programme',name='brand'))
         self.dependency_tree = QTableWidget(0,3)
-        self.dependency_tree.setHorizontalHeaderLabels(['Composant','État','Détail'])
+        bind_text(self.dependency_tree, 'setHorizontalHeaderLabels', ['Composant','État','Détail'])
         self.dependency_tree.horizontalHeader().setSectionResizeMode(0,QHeaderView.ResizeMode.ResizeToContents)
         self.dependency_tree.horizontalHeader().setSectionResizeMode(1,QHeaderView.ResizeMode.ResizeToContents)
         self.dependency_tree.horizontalHeader().setSectionResizeMode(2,QHeaderView.ResizeMode.Stretch)
@@ -1915,19 +2249,17 @@ class DownloaderWindow(QMainWindow):
             status = 'Mise à jour' if update else ('Prêt' if state.ok else 'À réparer')
             detail = state.detail + (f'  →  {update[1]}' if update else '')
             for col,text in enumerate((state.name,status,detail)):
-                item = QTableWidgetItem(text); item.setToolTip(text); tree.setItem(row,col,item)
+                item = ui(QTableWidgetItem(), text=text); bind_text(item, 'setToolTip', text); tree.setItem(row,col,item)
         tree.blockSignals(False)
         active = self.analysis_running or self.download_thread is not None
         missing_states = [state for state in self.dependency_states if not state.ok]
         self.dependency_alert_label.setVisible(bool(missing_states))
         self.dependency_dialog.setModal(bool(missing_states))
-        self.dependency_dialog.setWindowTitle(
-            'Composants requis manquants' if missing_states else 'Dépendances')
+        bind_text(self.dependency_dialog, 'setWindowTitle', 'Composants requis manquants' if missing_states else 'Dépendances')
         self.dependency_check_button.setEnabled(not self.dependency_busy and not active)
         missing = any(not state.ok and state.repairable for state in self.dependency_states)
         self.dependency_install_button.setEnabled(missing and not self.dependency_busy and not active)
-        self.dependency_update_button.setText(
-            f'Mettre à jour ({len(self.dependency_updates)})' if self.dependency_updates
+        bind_text(self.dependency_update_button, 'setText', f'Mettre à jour ({len(self.dependency_updates)})' if self.dependency_updates
             else 'Rechercher les mises à jour')
         self.dependency_update_button.setEnabled(not self.dependency_busy and not active)
         self.dependency_cancel_button.setEnabled(self.dependency_busy)

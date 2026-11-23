@@ -7,6 +7,7 @@ avoids the FFmpeg network path used by ``--download-sections``.
 """
 
 from __future__ import annotations
+from app_logging import log_event
 
 from dataclasses import dataclass
 import http.cookiejar
@@ -312,15 +313,21 @@ class RangeReader:
         return urllib.request.build_opener(*handlers)
 
     def _open(self, request):
+        log_event('range.request', url=self.url, byte_range=request.get_header('Range'), timeout=self.timeout)
         try:
-            return self.opener.open(request, timeout=self.timeout)
+            response = self.opener.open(request, timeout=self.timeout)
+            log_event('range.response', status=getattr(response, 'status', None),
+                      content_range=response.headers.get('Content-Range'))
+            return response
         except urllib.error.HTTPError as error:
+            log_event('range.http_error', code=error.code, error=str(error))
             # An HTTP refusal is not a TLS problem. Retrying it immediately with
             # certificate checks disabled only doubles the same CDN request and
             # can aggravate a 429 response.
             raise NativeClipUnsupported(
                 f"YouTube a refusé le fragment demandé : {error}") from error
         except (urllib.error.URLError, OSError) as error:
+            log_event('range.network_error', error=str(error))
             reason = getattr(error, "reason", error)
             tls_error = isinstance(reason, (ssl.SSLError, ssl.CertificateError))
             if str(self.url).startswith("https://") and tls_error:
@@ -334,6 +341,7 @@ class RangeReader:
 
     def cancel(self):
         """Interrupt an active CDN body read from the GUI thread."""
+        log_event('range.cancel', url=self.url)
         with self._response_lock:
             response = self._response
             self._response = None
@@ -439,6 +447,7 @@ class RangeReader:
             if current <= wanted_end and response_end >= wanted_end:
                 raise NativeClipUnsupported(
                     "Le flux s’est interrompu avant la fin du fragment demandé.")
+        log_event('range.read_complete', start=first, end=wanted_end, received=current-first)
         return b"".join(chunks)
 
 

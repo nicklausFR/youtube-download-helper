@@ -1,7 +1,10 @@
 """Windows yt-dlp, FFmpeg, subtitle, and indexed clip engine."""
 
 import json
+from dataclasses import dataclass
 from functools import wraps
+from app_logging import (log_event, log_exception, engine_event, start_process,
+                         process_result, verbose_options)
 import os
 from pathlib import Path
 import queue
@@ -22,9 +25,14 @@ from core_subtitles import clean_rolling_srt_file, trim_srt_file, format_timecod
 from partial_recovery import find_resumable_format
 from verified_session import VerifiedCredentials
 from windows_adapter import (CREATE_NO_WINDOW, terminate_process_tree, find_executable, ffprobe_for, _video_keyframe_times, _first_video_frame_time, _media_streams)
-from youtube_access import (access_args, cookie_access_failed, diagnostic_log, needs_verification, request_access_options, clean_ansi, subtitle_retryable, format_access_unavailable, without_forced_mweb, is_youtube_url)
+from youtube_access import (access_args, cookie_access_failed, diagnostic_log, needs_verification, request_access_options, clean_ansi, subtitle_retryable, format_access_unavailable, is_youtube_url)
 from strategies import DEFAULT_ACCESS, DEFAULT_DOWNLOADS
-from youtube_access import pot_provider_failed, without_pot_provider
+from youtube_access import (
+    ACCESS_FALLBACK_SEPARATOR, POT_VERSION_TIMEOUT_MESSAGE, pot_provider_failed,
+    pot_provider_version_timed_out, without_pot_provider,
+    transient_network_error,
+    alternate_youtube_options,
+)
 
 ANALYSIS_TIMEOUT_SECONDS = 90
 AUTOMATIC_ANALYSIS_TIMEOUT_SECONDS = 40
@@ -35,6 +43,7 @@ SUBTITLE_MAX_SECONDS = 180
 SUBTITLE_RETRY_DELAYS = (4, 8, 12, 20)
 SUBTITLE_ATTEMPTS = len(SUBTITLE_RETRY_DELAYS) + 1
 TRANSLATED_SUBTITLE_WAIT_SECONDS = 60
+DOWNLOAD_RETRY_DELAYS = (2, 5, 10)
 
 _DOWNLOAD_TERMINAL_EVENTS = {
     "download_done", "download_error", "download_cancelled",
@@ -42,6 +51,13 @@ _DOWNLOAD_TERMINAL_EVENTS = {
 }
 _worker_events = threading.local()
 _RATE_RESTART = object()
+
+
+@dataclass(frozen=True)
+class _DownloadRetry:
+    reason: str
+    kind: str = "network"
+    options: tuple | None = None
 
 
 def _after_download_cleanup(method):
@@ -66,6 +82,7 @@ class WindowsEngineMixin:
     _ffmetadata_escape = staticmethod(_ffmetadata_escape)
 
     def _emit_event(self, event):
+        engine_event(self, event)
         sink = getattr(_worker_events, "sink", None)
         if (sink is not None and sink[0] is self
                 and event[0] in _DOWNLOAD_TERMINAL_EVENTS):
@@ -79,6 +96,7 @@ class WindowsEngineMixin:
         if not 0 <= limit <= MAX_RATE_BPS or (limit and limit < MIN_RATE_BPS):
             raise ValueError("Limite de débit invalide")
         if limit != getattr(self, "download_rate_bps", 0):
+            log_event('download.rate_changed', engine=hex(id(self)), old_bps=getattr(self, 'download_rate_bps', 0), new_bps=limit)
             self.download_rate_bps = limit
             self.download_rate_revision = getattr(self, "download_rate_revision", 0) + 1
 
@@ -122,25 +140,45 @@ class WindowsEngineMixin:
                     or getattr(self, "analysis_data", None) or {})
             if not analysis and data.get('_downloader_access_recovery') == 'without_provider':
                 options = without_pot_provider(options)
-            yield options
+            elif not analysis and data.get('_downloader_access_recovery') == 'mweb':
+                options = alternate_youtube_options(options)
+            log_event('access.selected', engine=hex(id(self)), analysis=analysis,
+                      session='verified' if isinstance(session, VerifiedCredentials) else ('browser' if session else 'anonymous'),
+                      provider='--plugin-dirs' in options, recovery=data.get('_downloader_access_recovery'))
+            yield verbose_options(options)
 
-    def cancel(self):
+    def cancel(self, *, background=False):
         """Interrupt all active I/O owned by this engine."""
+        log_event('engine.cancel', engine=hex(id(self)), background=background)
         self.cancel_requested = True
         self.analysis_token += 1
         self.keyframe_token += 1
-        if self.native_reader is not None:
-            self.native_reader.cancel()
-        for process in (self.analysis_process, self.keyframe_process,
-                        self.download_process, self.subtitle_process):
-            if process is not None:
+        reader = self.native_reader
+        processes = tuple(process for process in (
+            self.analysis_process, self.keyframe_process, self.download_process, self.subtitle_process
+        ) if process is not None)
+
+        def interrupt():
+            if reader is not None:
+                reader.cancel()
+            for process in processes:
                 terminate_process_tree(process)
+
+        if background and (reader is not None or processes):
+            threading.Thread(target=interrupt, daemon=True).start()
+        else:
+            interrupt()
 
 
     def _analyze_worker(self, url, token, session=False, fallback=False):
+        from youtube_access import youtube_video_id
+        log_event('analysis.start', engine=hex(id(self)), video_id=youtube_video_id(url),
+                  url=url, generation=token, timeout=ANALYSIS_TIMEOUT_SECONDS)
         deadline = time.monotonic() + ANALYSIS_TIMEOUT_SECONDS
         provider_fallback = False
         provider_error = ""
+        network_retries = 0
+        client_fallback = False
         try:
             while True:
                 if token != self.analysis_token:
@@ -148,6 +186,8 @@ class WindowsEngineMixin:
                 with self._access_options(session, analysis=True) as options:
                     if provider_fallback:
                         options = without_pot_provider(options)
+                    elif client_fallback:
+                        options = alternate_youtube_options(options)
                     uses_provider = "--plugin-dirs" in options
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
@@ -155,13 +195,18 @@ class WindowsEngineMixin:
                     attempt_timeout = (min(AUTOMATIC_ANALYSIS_TIMEOUT_SECONDS, remaining)
                                        if uses_provider else remaining)
                     timed_out = False
+                    log_event('analysis.attempt', engine=hex(id(self)), generation=token,
+                              timeout=attempt_timeout, provider=uses_provider,
+                              provider_fallback=provider_fallback, client_fallback=client_fallback,
+                              network_retries=network_retries)
                     cmd = [self.ytdlp, *options, "--dump-single-json", "--no-playlist", url]
                     with self.analysis_lock:
                         if token != self.analysis_token:
                             return
-                        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                        proc = start_process(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             text=True, encoding="utf-8", errors="replace", creationflags=CREATE_NO_WINDOW)
                         self.analysis_process = proc
+                    stdout = stderr = ''
                     try:
                         stdout, stderr = proc.communicate(timeout=attempt_timeout)
                     except subprocess.TimeoutExpired as expired:
@@ -183,6 +228,7 @@ class WindowsEngineMixin:
                                    f"L’analyse dépasse {ANALYSIS_TIMEOUT_SECONDS} secondes. Réessayez plus tard.")
                         stderr = message + ("\n\n" + diagnostic_log(stderr) if stderr else "")
                     finally:
+                        process_result(proc, phase='analysis', output=stderr, timeout=timed_out)
                         with self.analysis_lock:
                             if self.analysis_process is proc:
                                 self.analysis_process = None
@@ -193,13 +239,17 @@ class WindowsEngineMixin:
                     data["_downloader_diagnostics"] = diagnostic_log(stderr)
                     if provider_fallback:
                         data["_downloader_access_recovery"] = "without_provider"
+                        reason = (POT_VERSION_TIMEOUT_MESSAGE if pot_provider_version_timed_out(provider_error)
+                                  else "Échec ou délai dépassé de l’accès automatique.")
                         data["_downloader_diagnostics"] = (
-                            "Accès de secours sans BgUtils après un échec ou un délai dépassé de l’accès automatique.\n"
+                            f"Accès de secours sans BgUtils. {reason}\n"
                             + data["_downloader_diagnostics"])
+                    elif client_fallback:
+                        data['_downloader_access_recovery'] = 'mweb'
                     self._emit_event(("analysis_ok", token, data))
                     return
                 error = stderr.strip() or stdout.strip() or "Erreur d’analyse"
-                if (not provider_fallback and (pot_provider_failed(error) or (timed_out and uses_provider))
+                if (uses_provider and (pot_provider_failed(error) or timed_out)
                         and time.monotonic() < deadline):
                     provider_error = diagnostic_log(error)
                     provider_fallback = True
@@ -208,15 +258,32 @@ class WindowsEngineMixin:
                     session, fallback = False, False
                     self._emit_event(("session_unavailable", token))
                     continue
+                if (uses_provider and not provider_fallback and not client_fallback
+                        and (needs_verification(error) or 'http error 403' in error.lower())
+                        and time.monotonic() < deadline):
+                    client_fallback = True
+                    continue
+                if (not timed_out and transient_network_error(error)
+                        and network_retries < 2 and deadline - time.monotonic() > 5):
+                    network_retries += 1
+                    # A temporary CDN/API failure needs a fresh extraction, not
+                    # a verification prompt. The same global deadline still applies.
+                    wait_until = min(deadline, time.monotonic() + network_retries)
+                    while time.monotonic() < wait_until:
+                        if token != self.analysis_token:
+                            return
+                        time.sleep(min(0.1, max(0, wait_until - time.monotonic())))
+                    continue
                 verification_required = needs_verification(error)
                 if provider_error:
-                    error = provider_error + "\n\nAccès de secours :\n" + error
+                    error = provider_error + ACCESS_FALLBACK_SEPARATOR + error
                 if verification_required:
                     self._emit_event(("verification_required", token, error, None))
                 else:
                     self._emit_event(("analysis_error", token, error))
                 return
         except Exception as error:
+            log_exception('analysis.exception', engine=hex(id(self)), generation=token)
             if token == self.analysis_token:
                 self._emit_event(("analysis_error", token, str(error)))
 
@@ -231,7 +298,7 @@ class WindowsEngineMixin:
             "--progress-delta", "0.2", "-f", format_id, "-o", output,
             *options, url,
         ]
-        process = subprocess.Popen(
+        process = start_process(
             command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, encoding="utf-8", errors="replace", bufsize=1,
             creationflags=CREATE_NO_WINDOW,
@@ -299,6 +366,7 @@ class WindowsEngineMixin:
         except Exception:
             terminate_process_tree(process)
             return_code = -1
+        process_result(process, phase='keyframe_index', output='\n'.join(output_lines), timeout=stalled)
         read_thread.join(timeout=2)
         try:
             process.stdout.close()
@@ -377,6 +445,11 @@ class WindowsEngineMixin:
     @_after_download_cleanup
     def _download_worker(self, url, folder, mode, fmt, subtitle_lang, merge_format,
                          clip=None, session=False, *, partial_path=None):
+        from youtube_access import youtube_video_id
+        log_event('download.start', engine=hex(id(self)), video_id=youtube_video_id(url),
+                  url=url, folder=folder, mode=mode, format_id=fmt, subtitles=subtitle_lang,
+                  container=merge_format, clip=clip, partial_path=partial_path,
+                  rate_bps=getattr(self, 'download_rate_bps', 0))
         subtitle_job = None
         try:
             with self._access_options(session) as options:
@@ -423,6 +496,7 @@ class WindowsEngineMixin:
                              merge_format, clip, options, session,
                              finish_parallel_subtitles)
         except Exception as error:
+            log_exception('download.exception', engine=hex(id(self)))
             self._emit_event(("download_error", str(error)))
         finally:
             if subtitle_job and subtitle_job["thread"].is_alive():
@@ -437,11 +511,12 @@ class WindowsEngineMixin:
             if self.cancel_requested:
                 return None
             cmd = [self.ytdlp, *options, '--dump-single-json', '--no-playlist', url]
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            proc = start_process(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                     text=True, encoding='utf-8', errors='replace',
                                     creationflags=CREATE_NO_WINDOW)
             self.download_process = proc
             timed_out = False
+            stdout = stderr = ''
             try:
                 if self.cancel_requested:
                     terminate_process_tree(proc)
@@ -454,6 +529,7 @@ class WindowsEngineMixin:
                 if isinstance(stderr, bytes):
                     stderr = stderr.decode('utf-8', errors='replace')
             finally:
+                process_result(proc, phase='partial_metadata', output=stderr, timeout=timed_out)
                 self.download_process = None
 
             if self.cancel_requested:
@@ -589,7 +665,7 @@ class WindowsEngineMixin:
                   if translated else []),
                 "--sub-langs", subtitle_lang, "-o", output, url,
             ]
-            process = subprocess.Popen(
+            process = start_process(
                 command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, encoding="utf-8", errors="replace",
                 bufsize=1,
@@ -663,6 +739,7 @@ class WindowsEngineMixin:
                 stdout = "\n".join(output_lines)
                 last_error = timeout_error or stdout.strip()
             finally:
+                process_result(process, phase='subtitles', output='\n'.join(output_lines), timeout=bool(timeout_error))
                 self.subtitle_process = None
             if self.cancel_requested or (stop_event and stop_event.is_set()):
                 return False, "Téléchargement des sous-titres annulé."
@@ -814,7 +891,7 @@ class WindowsEngineMixin:
             "--sponsorblock-mark", "all", "-f", fmt,
             "--print", "before_dl:" + template, *options, url,
         ]
-        process = subprocess.Popen(
+        process = start_process(
             command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, encoding="utf-8", errors="replace", bufsize=1,
             creationflags=CREATE_NO_WINDOW)
@@ -871,6 +948,8 @@ class WindowsEngineMixin:
                 terminate_process_tree(process)
                 break
         return_code = process.wait()
+        process_result(process, phase='native_clip_metadata',
+                       output='\n'.join(line for line in lines if not line.startswith(CLIP_INFO_PREFIX)), timeout=stalled)
         reader.join(timeout=2)
         process.stdout.close()
         self.download_process = None
@@ -895,14 +974,16 @@ class WindowsEngineMixin:
 
 
     def _run_cancellable_media_command(self, command):
-        process = subprocess.Popen(
+        process = start_process(
             command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, encoding="utf-8", errors="replace",
             creationflags=CREATE_NO_WINDOW)
         self.download_process = process
+        output = ''
         try:
             output, _ = process.communicate()
         finally:
+            process_result(process, phase='ffmpeg', output=output)
             if self.download_process is process:
                 self.download_process = None
         if self.cancel_requested:
@@ -1273,7 +1354,7 @@ class WindowsEngineMixin:
             "download_phase",
             "Coupe sans réencodage · copie directe entre les images clés…"))
         output_lines = []
-        process = subprocess.Popen(
+        process = start_process(
             command,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -1305,6 +1386,7 @@ class WindowsEngineMixin:
                 terminate_process_tree(process)
                 break
         return_code = process.wait()
+        process_result(process, phase='ffmpeg_clip', output='\n'.join(output_lines))
         process.stdout.close()
         self.download_process = None
         if self.cancel_requested:
@@ -1328,11 +1410,35 @@ class WindowsEngineMixin:
             alternate_client=False, subtitle_completion=None, resume_source=None):
         # A rate change restarts the same request iteratively. Repeated changes
         # must not accumulate recursive calls or let an old attempt close a new one.
+        network_retries = 0
         while True:
+            if self.cancel_requested:
+                self._emit_event(("download_cancelled",))
+                return
             result = self._download_with_access_attempt(
                 url, folder, mode, fmt, subtitle_lang, merge_format, clip, options,
                 alternate_client=alternate_client,
-                subtitle_completion=subtitle_completion, resume_source=resume_source)
+                subtitle_completion=subtitle_completion, resume_source=resume_source,
+                retry_network=network_retries < len(DOWNLOAD_RETRY_DELAYS))
+            if isinstance(result, _DownloadRetry):
+                if result.options is not None:
+                    options = list(result.options)
+                if result.kind == "route":
+                    alternate_client = True
+                if result.kind == "network":
+                    delay = DOWNLOAD_RETRY_DELAYS[network_retries]
+                    network_retries += 1
+                    message = (
+                        f"Connexion interrompue · reprise automatique {network_retries}/"
+                        f"{len(DOWNLOAD_RETRY_DELAYS)} dans {delay} s · {result.reason}")
+                else:
+                    delay = 0
+                    message = result.reason
+                self._emit_event(("download_phase", message))
+                wait_until = time.monotonic() + delay
+                while time.monotonic() < wait_until and not self.cancel_requested:
+                    time.sleep(min(0.1, max(0, wait_until - time.monotonic())))
+                continue
             if result is not _RATE_RESTART:
                 return result
             if self.cancel_requested:
@@ -1341,10 +1447,11 @@ class WindowsEngineMixin:
 
     def _download_with_access_attempt(
             self, url, folder, mode, fmt, subtitle_lang, merge_format, clip, options,
-            alternate_client=False, subtitle_completion=None, resume_source=None):
+            alternate_client=False, subtitle_completion=None, resume_source=None,
+            retry_network=False):
         if clip and mode != "subtitles" and is_youtube_url(url):
             native_attempts = [list(options)]
-            alternate_options = without_forced_mweb(options)
+            alternate_options = alternate_youtube_options(options)
             if alternate_options != list(options):
                 native_attempts.append(alternate_options)
             native_errors = []
@@ -1418,6 +1525,7 @@ class WindowsEngineMixin:
             "--continue",
             "--part",
             "--no-force-overwrites",
+            "--abort-on-unavailable-fragments",
             "--progress",
             "--progress-template",
             PROGRESS_TEMPLATE,
@@ -1487,9 +1595,10 @@ class WindowsEngineMixin:
             # Before the first progress event we are still connecting. A rate
             # change must take effect then too, but never interrupt a remux.
             postprocessing = False
+            media_processing = False
             rate_changed = False
 
-            proc = subprocess.Popen(
+            proc = start_process(
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
@@ -1506,7 +1615,7 @@ class WindowsEngineMixin:
             reader_finished = object()
 
             def read_output():
-                nonlocal postprocessing
+                nonlocal postprocessing, media_processing
                 try:
                     for item in proc.stdout:
                         # Observe the live subprocess phase here. The UI event
@@ -1518,13 +1627,16 @@ class WindowsEngineMixin:
                                 status = json.loads(line[len(PROGRESS_PREFIX):]).get('status')
                                 if status == 'downloading':
                                     postprocessing = False
+                                    media_processing = False
                                 elif status == 'finished':
                                     postprocessing = True
                             except (ValueError, TypeError, AttributeError):
                                 pass
                         elif line.startswith(('[Merger]', '[VideoRemuxer]', '[VideoConvertor]',
-                                              '[Metadata]', '[EmbedSubtitle]', RESULT_PREFIX)):
+                                              '[Metadata]', '[EmbedSubtitle]', '[Fixup',
+                                              '[ExtractAudio]', RESULT_PREFIX)):
                             postprocessing = True
+                            media_processing = True
                         line_queue.put(item)
                 except (OSError, ValueError):
                     pass
@@ -1555,6 +1667,10 @@ class WindowsEngineMixin:
                         break
                     if proc.poll() is not None and not reader.is_alive():
                         break
+                    # Merging/remuxing large files can be silent for minutes.
+                    # The network watchdog must never kill that local work.
+                    if media_processing:
+                        continue
                     waiting = time.monotonic() - last_output
                     wait_second = int(waiting)
                     if (
@@ -1571,7 +1687,7 @@ class WindowsEngineMixin:
                                 + f"arrêt automatique à {stall_limit:g} s")
                         else:
                             wait_text = (
-                                "Coupe directe · "
+                                ("Coupe directe · " if clip else "Téléchargement · ")
                                 + (f"route {2 if alternate_client else 1}/2 · "
                                    if precise_video_clip else "")
                                 + f"aucune donnée depuis {wait_second} s · "
@@ -1608,8 +1724,9 @@ class WindowsEngineMixin:
                     continue
                 update = progress.parse(line)
                 if update is not None:
-                    eta = (progress.eta_seconds,) if progress.eta_seconds is not None else ()
-                    self._emit_event(("download_progress", *update, *eta))
+                    eta, speed = progress.eta_seconds, progress.speed_bps
+                    metrics = (eta, speed) if speed else (eta,) if eta is not None else ()
+                    self._emit_event(("download_progress", *update, *metrics))
                     if progress.detail_line:
                         self._emit_event((
                             "download_phase", progress.detail_line))
@@ -1648,15 +1765,12 @@ class WindowsEngineMixin:
                     if clip_temp:
                         shutil.rmtree(clip_temp, ignore_errors=True)
                         clip_temp = None
-                    self._emit_event((
-                        "download_phase",
+                    return _DownloadRetry(
                         "Coupe directe · première route sans réponse · "
                         "nouvel essai automatique par une autre route YouTube…",
-                    ))
-                    return self._download_with_access(
-                        url, folder, mode, fmt, subtitle_lang, merge_format, clip,
-                        without_forced_mweb(options), alternate_client=True,
-                        subtitle_completion=subtitle_completion)
+                        kind="route", options=tuple(alternate_youtube_options(options)))
+                if not clip and retry_network:
+                    return _DownloadRetry(f"aucune donnée depuis {stall_limit:g} s")
                 error = (
                     f"YouTube n’a transmis aucune nouvelle donnée pendant "
                     f"{stall_limit:g} secondes. Le téléchargement bloqué "
@@ -1665,13 +1779,19 @@ class WindowsEngineMixin:
                        if precise_video_clip else "\n\n")
                     + "L’accès automatique n’a pas suffi ; une vérification Google "
                     "peut permettre de reprendre exactement la même opération.")
-                self._emit_event((
-                    "verification_required", None, error,
-                    (url, folder, mode, fmt, subtitle_lang, merge_format, clip),
-                ))
+                if precise_video_clip:
+                    self._emit_event((
+                        "verification_required", None, error,
+                        (url, folder, mode, fmt, subtitle_lang, merge_format, clip),
+                    ))
+                else:
+                    self._emit_event(("download_error",
+                        f"Aucune donnée reçue pendant {stall_limit:g} secondes malgré les reprises "
+                        "automatiques. Le fichier partiel est conservé ; cliquez sur Reprendre."))
                 return
 
             rc = proc.wait()
+            process_result(proc, phase='download', output='\n'.join(output_lines))
             reader.join(timeout=2)
             proc.stdout.close()
             if rc == 0:
@@ -1740,6 +1860,13 @@ class WindowsEngineMixin:
                 self._emit_event(("download_done",result_paths,folder))
             else:
                 raw_details = "\n".join(output_lines[-20:]).strip()
+                if (not resume_source and "--plugin-dirs" in options
+                        and pot_provider_failed(raw_details)):
+                    return _DownloadRetry(
+                        "Accès automatique indisponible · reprise sans BgUtils…",
+                        kind="provider", options=tuple(without_pot_provider(options)))
+                if retry_network and not clip and transient_network_error(raw_details):
+                    return _DownloadRetry(diagnostic_log(raw_details)[-500:])
                 missing_format = not resume_source and format_access_unavailable(raw_details)
                 stream_forbidden = (
                     not resume_source and mode != "subtitles" and is_youtube_url(url)
@@ -1748,19 +1875,14 @@ class WindowsEngineMixin:
                             if line.startswith(("ERROR:", "[download]")))
                 )
                 if (missing_format or stream_forbidden) and not alternate_client:
-                    alternate_options = without_forced_mweb(options)
+                    alternate_options = alternate_youtube_options(options)
                     if alternate_options != list(options):
                         self.download_process = None
                         reason = ("Flux refusé par YouTube (HTTP 403)" if stream_forbidden
                                   else "Format momentanément retiré par YouTube")
-                        self._emit_event((
-                            "download_phase",
+                        return _DownloadRetry(
                             f"{reason} · essai automatique par une autre route…",
-                        ))
-                        return self._download_with_access(
-                            url, folder, mode, fmt, subtitle_lang, merge_format, clip,
-                            alternate_options, alternate_client=True,
-                            subtitle_completion=subtitle_completion)
+                            kind="route", options=tuple(alternate_options))
                 if missing_format:
                     self.download_process = None
                     unavailable = (
@@ -1813,6 +1935,13 @@ class WindowsEngineMixin:
                     self._emit_event(("download_error", details))
 
         except Exception as e:
+            log_exception('download.attempt_exception', engine=hex(id(self)))
+            if "proc" in locals() and proc.poll() is None:
+                terminate_process_tree(proc)
+                try:
+                    proc.wait(timeout=8)
+                except subprocess.TimeoutExpired:
+                    pass
             self._emit_event(("download_error", str(e)))
         finally:
             if "proc" in locals() and proc.stdout is not None:

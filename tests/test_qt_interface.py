@@ -1,6 +1,7 @@
 import os
 os.environ.setdefault('QT_QPA_PLATFORM','offscreen')
 import sys
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch, MagicMock
@@ -36,27 +37,16 @@ class QtInterface(unittest.TestCase):
         self.assertNotIn('tkinter',sys.modules)
         self.assertFalse(hasattr(a,'theme_combo'))
         self.assertEqual(a.options_button.accessibleName(),'Options')
-        self.assertEqual([x.text() for x in a.options_menu.actions() if not x.isSeparator()],['Thème','Dépendances'])
+        self.assertEqual([x.text() for x in a.options_menu.actions() if not x.isSeparator()],['Thème','Langue','Dépendances'])
         self.assertFalse(a.options_button.icon().isNull())
         self.assertEqual(a.options_button.text(), '')
-        self.assertIs(a.options_button.parentWidget(), a.menuWidget())
-        self.assertLess(a.menuWidget().geometry().bottom(), a.centralWidget().geometry().top())
-        if a._extended_title_bar:
-            handle = a.windowHandle()
-            caption_height = handle.safeAreaMargins().top()
-            self.assertGreater(caption_height, 0)
-            self.assertEqual(a.title_bar.y(), 0)
-            self.assertGreaterEqual(a.title_bar.height(), caption_height)
-            self.assertGreater(a.title_bar.width() - a.options_button.geometry().right(),
-                               caption_height * 4.5)
-            caption = a.title_bar.findChild(QLabel, 'windowCaption')
-            self.assertTrue(caption.isVisible())
-            self.assertEqual(caption.text(), handle.title())
-            self.assertLess(caption.geometry().right(), a.options_button.geometry().left())
-            self.assertFalse(handle.flags() & Qt.WindowType.WindowTitleHint)
-            self.assertTrue(handle.flags() & Qt.WindowType.WindowCloseButtonHint)
-            self.assertEqual(handle.flags() & Qt.WindowType.WindowMinMaxButtonsHint,
-                             Qt.WindowType.WindowMinMaxButtonsHint)
+        self.assertIs(a.options_button.parentWidget(), a.source_panel)
+        flags = a.windowHandle().flags()
+        self.assertTrue(flags & Qt.WindowType.WindowTitleHint)
+        self.assertTrue(flags & Qt.WindowType.WindowCloseButtonHint)
+        self.assertEqual(flags & Qt.WindowType.WindowMinMaxButtonsHint, Qt.WindowType.WindowMinMaxButtonsHint)
+        if hasattr(Qt.WindowType, 'ExpandedClientAreaHint'):
+            self.assertFalse(flags & Qt.WindowType.ExpandedClientAreaHint)
         self.assertTrue(a.options_button.isVisible())
         QTest.mouseClick(a.options_button, Qt.MouseButton.LeftButton)
         self.assertTrue(a.options_menu.isVisible())
@@ -161,8 +151,10 @@ class QtInterface(unittest.TestCase):
         self.assertTrue(a.analysis_panel.isVisible())
         self.assertTrue(a.video_settings_panel.isHidden())
         self.assertFalse(a.download_button.isVisible())
-        self.assertEqual([label.text() for label in a.video_panel.findChildren(QLabel)
+        self.assertEqual([label.text() for label in a.analysis_panel.findChildren(QLabel)
                           if label.isVisible()], ['Analyse en cours…'])
+        self.assertTrue(a.selected_video_panel.isVisible())
+        self.assertEqual(a.selected_video_panel.property('videoUrl'), a.url_var.get())
         preview = a.queue_tabs.tabButton(0, a.queue_tabs.ButtonPosition.LeftSide)
         self.assertTrue(preview.title.text().startswith('https://'))
         spinners = [a.analysis_spinner, preview.spinner]
@@ -384,13 +376,52 @@ class QtInterface(unittest.TestCase):
         self.assertTrue(a.analysis_panel.isHidden())
         self.assertTrue(a.video_settings_panel.isVisible())
         self.assertTrue(a.queue_tabs.accessibleTabName(1).startswith('Vidéo consultée'))
-        self.assertNotIn('Vidéo consultée', [label.text() for label in a.video_panel.findChildren(QLabel)])
+        self.assertEqual(a.selected_video_title.text(), 'Vidéo consultée')
+        self.assertEqual(a.selected_video_panel.property('videoUrl'), queued)
         self.assertEqual(a.download_button.text(), 'Ajouter à la file')
         self.assertFalse(a.transfer_panel.isHidden())
         self.assertEqual(a.transfer_title_label.text(), 'Vidéo en téléchargement')
         self.assertTrue(a.queue_tabs.accessibleTabName(0).startswith('Vidéo en téléchargement'))
         a._show_queue_tab(current)
         self.assertFalse(a.transfer_panel.isHidden())
+        self.assertEqual(a.selected_video_title.text(), 'Vidéo en téléchargement')
+
+    def test_selected_video_identity_follows_tabs_and_ignores_other_thumbnails(self):
+        from test_thumbnails import image_bytes
+        a = self.window
+        first, second = 'https://youtu.be/aaaaaaaaaaa', 'https://youtu.be/bbbbbbbbbbb'
+        a.url_var.set(first)
+        data = dict(DATA, id='aaaaaaaaaaa', title='Première vidéo', channel='Chaîne A', duration=65)
+        a._process_analysis(data)
+        a.active_queue_url = first
+        a.pending_urls = [second]
+        a.tab_analysis_data[(second, a.access_var.get())] = dict(
+            DATA, id='bbbbbbbbbbb', title='Deuxième vidéo', channel='Chaîne B', duration=125)
+        blue = image_bytes('#2050ff')
+        a.thumbnail_cache['bbbbbbbbbbb'] = blue
+        a._show_queue_tab(second)
+        self.assertEqual(a.selected_video_title.text(), 'Deuxième vidéo')
+        self.assertEqual(a.selected_video_meta.text(), 'Chaîne B · 2:05')
+        self.assertEqual(a.selected_video_url.text(), second)
+        self.assertEqual(a.selected_video_panel.property('videoUrl'), second)
+        self.assertEqual(a.selected_video_thumbnail._thumbnail_content, blue)
+        a.events.put(('thumbnail', 'aaaaaaaaaaa', image_bytes('#ff0000')))
+        a._poll_events()
+        self.assertEqual(a.selected_video_title.text(), 'Deuxième vidéo')
+        self.assertEqual(a.selected_video_thumbnail._thumbnail_content, blue)
+        a._show_queue_tab(first)
+        self.assertEqual(a.selected_video_title.text(), 'Première vidéo')
+        self.assertEqual(a.selected_video_meta.text(), 'Chaîne A · 1:05')
+        self.assertEqual(a.selected_video_panel.property('videoUrl'), first)
+        a.resize(680, 530)
+        application().processEvents()
+        self.assertTrue(a.selected_video_title.isVisible())
+        self.assertTrue(a.selected_video_url.isHidden())
+        self.assertIn(first, a.selected_video_panel.toolTip())
+        a.resize(900, 810)
+        application().processEvents()
+        self.assertTrue(a.selected_video_url.isVisible())
+        self.assertEqual(a.selected_video_title.text(), 'Première vidéo')
 
     def test_all_paste_paths_add_url_during_download_without_changing_worker(self):
         a = self.window
@@ -778,12 +809,15 @@ class QtInterface(unittest.TestCase):
         self.assertIs(a.open_download_button.menu(), a.download_result_menu)
         self.assertFalse(a.download_button.isEnabled())
 
-    def test_cancel_interrupts_the_native_connection_immediately(self):
+    def test_cancel_interrupts_the_native_connection_without_blocking(self):
         a=self.window
         a.download_thread=MagicMock()
         a.native_reader=MagicMock()
+        interrupted = threading.Event()
+        a.native_reader.cancel.side_effect = interrupted.set
         a.cancel_button.setEnabled(True)
         a._cancel_download()
+        self.assertTrue(interrupted.wait(5))
         a.native_reader.cancel.assert_called_once_with()
         self.assertTrue(a.cancel_requested)
         self.assertFalse(a.cancel_button.isEnabled())

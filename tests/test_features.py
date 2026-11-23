@@ -22,7 +22,7 @@ m.YoutubeDownloaderApp._check_dependencies=lambda self:None
 save_checkpoint = m.YoutubeDownloaderApp._save_download_checkpoint
 restore_checkpoint = m.YoutubeDownloaderApp._restore_download_checkpoint
 # Tests must never read or overwrite the user's interrupted downloads.
-m.YoutubeDownloaderApp._save_download_checkpoint=lambda self:None
+m.YoutubeDownloaderApp._save_download_checkpoint=lambda self,**kwargs:None
 m.YoutubeDownloaderApp._restore_download_checkpoint=lambda self:None
 def audio(fid,lang,rate,size,pref=10):
     return dict(format_id=fid,vcodec='none',acodec='mp4a.40.2',language=lang,abr=rate,filesize=size,ext='m4a',language_preference=pref)
@@ -318,16 +318,17 @@ class Features(unittest.TestCase):
             process=original([sys.executable,'-c','import time;time.sleep(30)'],**kwargs)
             started.append(process)
             return process
-        with patch.object(m,'DOWNLOAD_STALL_SECONDS',0.3),patch.object(m.subprocess,'Popen',side_effect=silent):
+        with patch.object(m,'DOWNLOAD_STALL_SECONDS',0.3), \
+                patch('windows_engine.DOWNLOAD_RETRY_DELAYS', (0, 0, 0)), \
+                patch.object(m.subprocess,'Popen',side_effect=silent):
             a._download_with_access('https://youtu.be/test',str(ROOT),'video_only','720',None,None,None,[])
         events=[]
         while not a.events.empty():events.append(a.events.get_nowait())
-        verification=next(event for event in events if event[0]=='verification_required')
-        self.assertIn('bloqué a été arrêté automatiquement',verification[2])
-        self.assertEqual(verification[3][2],'video_only')
-        self.assertIsNone(verification[3][6])
-        self.assertFalse(any(event[0]=='download_error' for event in events))
-        self.assertTrue(started and started[0].poll() is not None)
+        error=next(event for event in events if event[0]=='download_error')
+        self.assertIn('malgré les reprises automatiques',error[1])
+        self.assertFalse(any(event[0]=='verification_required' for event in events))
+        self.assertEqual(len(started),4)
+        self.assertTrue(all(process.poll() is not None for process in started))
 
     def test_silent_clip_tries_two_routes_before_google_verification(self):
         a=self.a
@@ -1234,6 +1235,43 @@ class Features(unittest.TestCase):
         self.assertEqual(event[0],'analysis_error')
         self.assertIn('Accès de secours',event[2])
 
+    def test_bgutils_version_timeout_tries_fallback_and_explains_the_result(self):
+        from youtube_access import pot_provider_failed
+
+        error = "ERROR: Command " + repr([
+            r"C:\Users\nicklaus\Code\python\youtube-download-helper\_dependencies\_pot\runtime\node.exe",
+            r"D:\Code\python\youtube-download-helper\_dependencies\_pot\build\generate_once.js",
+            "--version",
+        ]) + " timed out after 15.0 seconds"
+        self.assertFalse(pot_provider_failed("ERROR: Connection timed out after 15.0 seconds"))
+        self.assertFalse(pot_provider_failed(error.replace("generate_once.js", "other.js")))
+        failed = MagicMock(returncode=1)
+        failed.communicate.return_value = ("", error)
+        recovered = MagicMock(returncode=0)
+        recovered.communicate.return_value = (json.dumps(DATA), "")
+        with patch.object(m.subprocess, "Popen", side_effect=[failed, recovered]) as start:
+            self.a._analyze_worker("url", self.a.analysis_token)
+        self.assertEqual(start.call_count, 2)
+        self.assertIn("--no-plugin-dirs", start.call_args.args[0])
+        kind, _, data = self.a.events.get_nowait()
+        self.assertEqual(kind, "analysis_ok")
+        self.a._process_analysis(data)
+        diagnostic = self.a._diagnostic_text()
+        self.assertIn("Accès : Secours sans BgUtils", diagnostic)
+        self.assertIn("BgUtils n’a pas répondu à la vérification de sa version", diagnostic)
+
+        failed_fallback = MagicMock(returncode=1)
+        failed_fallback.communicate.return_value = ("", "ERROR: Video unavailable")
+        with patch.object(m.subprocess, "Popen", side_effect=[failed, failed_fallback]) as start:
+            self.a._analyze_worker("url", self.a.analysis_token)
+        self.assertEqual(start.call_count, 2)
+        kind, _, combined_error = self.a.events.get_nowait()
+        self.assertEqual(kind, "analysis_error")
+        self.assertIn(error, combined_error)
+        self.assertIn("Video unavailable", m.readable_error(combined_error))
+        self.assertIn("BgUtils n’a pas répondu à la vérification de sa version",
+                      m.extraction_issue(combined_error))
+
     def test_provider_error_hides_large_session_context(self):
         error="_get_pot_via_script failed: TimeoutExpired(['node', '--innertube-context', '{secret-context}'])"
         message=m.readable_error(error)
@@ -1475,7 +1513,7 @@ class Features(unittest.TestCase):
         start.assert_called_once()
     def test_automatic_provider_configuration(self):
         options=m.access_args(False,True)
-        self.assertIn('youtube:player_client=mweb',options)
+        self.assertNotIn('youtube:player_client=mweb',options)
         self.assertIn('--plugin-dirs',options)
         self.assertTrue(any('server_home=' in item for item in options))
         self.assertFalse(hasattr(self.a,'verify_button'))

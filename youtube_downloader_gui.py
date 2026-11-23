@@ -1,5 +1,8 @@
+from qt_i18n import bind_text, message
 import json
 import io
+import logging
+from app_logging import log_event, log_path, setup_logging, catalog_summary
 import urllib.request
 from contextlib import contextmanager
 from http.client import HTTPException
@@ -15,8 +18,10 @@ import tempfile
 import threading
 import time
 from qt_controls import Value, messagebox
-from qt_window import DownloaderWindow, application
-from PySide6.QtCore import QSignalBlocker
+from qt_window import DownloaderWindow, ShutdownCountdown, application
+from qt_download_list import DEFAULT_FORMATS
+from PySide6.QtCore import QSettings, QSignalBlocker
+from PySide6.QtWidgets import QDialog
 from urllib.parse import urlencode
 
 from dependency_manager import DependencyManager
@@ -48,7 +53,7 @@ from core_progress import (
 )
 from partial_recovery import estimate_saved_progress, matches_saved_download, partial_name
 from windows_adapter import (
-    CREATE_NO_WINDOW, terminate_process_tree, app_dir, dependency_dir,
+    CREATE_NO_WINDOW, shutdown_windows, terminate_process_tree, app_dir, dependency_dir,
     find_executable, _first_video_frame_time, _video_keyframe_times,
     _media_streams,
 )
@@ -102,8 +107,20 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
     def _current_url_for_engine(self):
         return self.url_var.get().strip()
 
-    def __init__(self):
+    def cancel(self):
+        super().cancel(background=True)
+
+    def __init__(self, *, list_view=False):
         super().__init__()
+        log_event('ui.window_created')
+
+        self.list_view = list_view
+        self.download_defaults = self._read_format_defaults() if list_view else DEFAULT_FORMATS.copy()
+        self.completed_downloads = {}
+        self.download_list_order = []
+        self.completed_selection = None
+        self.list_transfer_eta = None
+        self.list_transfer_speed = None
 
         self.download_rate_bps = 0
         self.download_rate_revision = 0
@@ -208,6 +225,7 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
         self.download_retry_pending = False
         self.download_results = []
         self.download_result_folder = ''
+        self._shutdown_dialog = None
         self.pending_urls = []
         self._video_tab_order = []
         self.queued_downloads = {}
@@ -227,6 +245,9 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
         self.queue_analysis_waiting = []
         self.queue_analysis_errors = {}
         self.queue_analysis_completed = set()
+        self.queue_reanalysis_waiting = set()
+        self.queue_analysis_reanalyzing = False
+        self.queue_reanalysis_failed = set()
         self.format_help_var = Value()
         self.original_language = None
         self.resolution_var = Value()
@@ -247,6 +268,10 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
         self.download_detail_started = None
         self.download_progress_value = 0.0
         self._download_checkpoint_at = 0.0
+        self._checkpoint_lock = threading.Lock()
+        self._checkpoint_pending = None
+        self._checkpoint_thread = None
+        self._checkpoint_timer = None
         self.title_var = Value(value="")
 
         self._build_ui()
@@ -261,7 +286,7 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
         self.after(100, self._poll_events)
 
     def _rate_limit_changed(self, value):
-        unit = self.rate_unit_combo.currentText()
+        unit = self.rate_unit_combo.currentSourceText()
         self.set_download_rate_bps(rate_to_bps(value, unit))
         if value and value * RATE_UNITS[unit][0] < MIN_RATE_BPS:
             self._display_rate_limit(unit)
@@ -300,10 +325,16 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
             'title', 'id', 'duration', 'language', 'is_live', 'live_status',
             '_downloader_access_recovery',
         ) if key in data}
+        saved.update(self._video_description_snapshot(data))
         saved['formats'] = [self._format_snapshot(item) for item in data.get('formats') or []]
         saved['_saved_language_info'] = language_info
         saved['_saved_subtitle_tracks'] = tracks
         return saved
+
+    @staticmethod
+    def _video_description_snapshot(data):
+        return {key: data[key] for key in ('channel', 'uploader', 'description')
+                if isinstance(data.get(key), str)}
 
     def _download_job_snapshot(self, job):
         sel = job['selection']
@@ -317,32 +348,39 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
             data=dict(title=job['title'], id=data.get('id'), duration=data.get('duration'),
                 language=data.get('language'),
                 formats=[self._format_snapshot(item) for item in data.get('formats') or []],
-                _downloader_access_recovery=data.get('_downloader_access_recovery')))
+                _downloader_access_recovery=data.get('_downloader_access_recovery'),
+                **self._video_description_snapshot(data)))
         if job.get('partial_path'):
             saved['partial_path'] = job['partial_path']
         if 'progress' in job:
             saved['progress'] = job['progress']
         return saved
 
-    def _save_download_checkpoint(self):
+    def _save_download_checkpoint(self, *, flush=False):
         """Persist open tabs and requests without signed media URLs or credentials."""
         self._save_tab_settings()
+        access = self.access_var.get()
         tabs = []
-        for url in self._video_tab_urls():
+        urls = self._video_tab_urls()
+        if self.list_view:
+            self._sync_download_list_order(urls)
+        for url in urls:
             if url != self.closing_transfer_tab_url and is_youtube_url(url):
-                data = self.tab_analysis_data.get((url, self.access_var.get()), {})
+                data = self.tab_analysis_data.get((url, access), {})
                 title = data.get('title') or self.tab_preview_titles.get(youtube_video_id(url) or url, '')
                 tab = dict(url=url, title=title, settings=self.queue_tab_settings.get(url, {}))
                 if data and not (data.get('is_live') or data.get('live_status') in ('is_live', 'is_upcoming')):
-                    tab['analysis'] = self._analysis_snapshot(data)
+                    tab['analysis'] = data
                 tabs.append(tab)
         active = None
         if self.active_download_job and (not self.cancel_requested or self.download_pause_requested):
-            active = self._download_job_snapshot(self.active_download_job)
             restarts_clip = (self.download_pause_requested
                              and self._download_restarts_clip(self.active_download_job))
-            active['progress'] = 0.0 if restarts_clip else self.download_progress_value
-        waiting = {url: self._download_job_snapshot(job) for url, job in self.queued_downloads.items()}
+            active = dict(self.active_download_job,
+                          progress=0.0 if restarts_clip else self.download_progress_value)
+        # Capture the ordering and UI state here. Published analysis data and
+        # download requests are replaced, rather than edited, after capture.
+        waiting = self.queued_downloads.copy()
         if active and self.priority_download_url in waiting:
             priority = waiting.pop(self.priority_download_url)
             waiting = {self.priority_download_url: priority, active['request'][0]: active, **waiting}
@@ -351,11 +389,62 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
             tabs=tabs, selected=self.queue_view_url,
             active=active,
             waiting=list(waiting.values()),
+            completed=self.completed_downloads.copy(),
+            list_order=list(self.download_list_order),
+            completed_selection=self.completed_selection,
         )
-        self.preferences.setValue('download_checkpoint', json.dumps(saved, ensure_ascii=False))
-        self.preferences.sync()
         if active:
             self._download_checkpoint_at = time.monotonic()
+        if flush:
+            # No older save may overwrite the final snapshot when closing.
+            self.after_cancel(self._checkpoint_timer)
+            self._checkpoint_timer = None
+            with self._checkpoint_lock:
+                self._checkpoint_pending = None
+                worker = self._checkpoint_thread
+            if worker is not None:
+                worker.join()
+            self._write_download_checkpoint(self.preferences, saved)
+            return
+        with self._checkpoint_lock:
+            self._checkpoint_pending = saved
+            if self._checkpoint_thread is None and self._checkpoint_timer is None:
+                # Combine nearby changes and let Qt paint before starting the write.
+                self._checkpoint_timer = self.after(150, self._start_checkpoint_writer)
+
+    def _start_checkpoint_writer(self):
+        self._checkpoint_timer = None
+        with self._checkpoint_lock:
+            self._checkpoint_thread = threading.Thread(
+                target=self._write_pending_checkpoints, daemon=True)
+            self._checkpoint_thread.start()
+
+    def _write_download_checkpoint(self, settings, captured):
+        tabs = []
+        for tab in captured['tabs']:
+            if 'analysis' in tab:
+                tab = dict(tab, analysis=self._analysis_snapshot(tab['analysis']))
+            tabs.append(tab)
+        saved = dict(captured, tabs=tabs,
+                     active=self._download_job_snapshot(captured['active']) if captured['active'] else None,
+                     waiting=[self._download_job_snapshot(job) for job in captured['waiting']])
+        settings.setValue('download_checkpoint', json.dumps(saved, ensure_ascii=False))
+        settings.sync()
+
+    def _write_pending_checkpoints(self):
+        # Use a separate QSettings instance owned by this thread.
+        settings = QSettings()
+        while True:
+            with self._checkpoint_lock:
+                saved = self._checkpoint_pending
+                self._checkpoint_pending = None
+                if saved is None:
+                    self._checkpoint_thread = None
+                    return
+            try:
+                self._write_download_checkpoint(settings, saved)
+            except Exception:
+                logging.getLogger(__name__).exception('Could not save the download checkpoint')
 
     def _read_download_job_snapshot(self, job):
         if not isinstance(job, dict):
@@ -396,6 +485,7 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
         else:
             return
 
+        self._restore_completed_downloads(saved)
         active_url = active['request'][0] if active else None
         self.queued_downloads = {job['request'][0]: job for job in waiting if job['request'][0] != active_url}
         jobs = {active_url: active} if active else {}
@@ -409,7 +499,8 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
         urls = []
         for tab in tabs if isinstance(tabs, list) else ():
             url = tab.get('url') if isinstance(tab, dict) else None
-            if not is_youtube_url(url) or url in urls:
+            if (not is_youtube_url(url) or url in urls
+                    or (url in self.completed_downloads and url not in jobs)):
                 continue
             urls.append(url)
             if isinstance(tab.get('title'), str) and tab['title']:
@@ -425,6 +516,7 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
 
         urls.extend(url for url in jobs if url not in urls)
         if not urls:
+            self._render_download_queue()
             return
         self._video_tab_order = urls
         self.active_queue_url = active_url or urls[0]
@@ -451,6 +543,23 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
             and not jobs.get(url, {}).get('partial_path')
         ]
         self._show_queue_tab(selected)
+
+    def _restore_completed_downloads(self, saved):
+        completed = saved.get('completed')
+        if isinstance(completed, dict):
+            for url, record in completed.items():
+                if (not is_youtube_url(url) or not isinstance(record, dict)
+                        or not isinstance(record.get('folder'), str)
+                        or not isinstance(record.get('paths'), list)
+                        or not isinstance(record.get('data'), dict)):
+                    continue
+                self.completed_downloads[url] = record
+        order = saved.get('list_order')
+        if isinstance(order, list):
+            self.download_list_order = list(dict.fromkeys(url for url in order if is_youtube_url(url)))
+        selected = saved.get('completed_selection')
+        if self.list_view and isinstance(selected, str) and selected in self.completed_downloads:
+            self.completed_selection = selected
 
     def _check_dependencies(self):
         if self.dependency_busy or self.download_thread is not None or self.analysis_running: return
@@ -507,6 +616,8 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
         threading.Thread(target=check_updates, daemon=True).start()
 
     def _dependencies_finished(self, states, repaired):
+        log_event('dependencies.checked', repaired=repaired,
+                  states=[dict(key=item.key, ok=item.ok, detail=item.detail) for item in states])
         self.dependency_busy = False
         if repaired:
             self.dependency_updates = {}
@@ -556,6 +667,9 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
 
     def _retry_analysis(self):
         url = self.url_var.get().strip()
+        if self.list_view:
+            self._reanalyze_list_video(self.completed_selection or url)
+            return
         if self._transfer_busy():
             if url in self.queue_analysis_errors:
                 self._schedule_queue_analysis(url)
@@ -575,6 +689,9 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
         self._on_url_changed()
 
     def _retry_analysis_now(self):
+        if self.list_view:
+            self._reanalyze_list_video(self.url_var.get().strip())
+            return
         if self.analysis_running or self.dependency_busy or self.dependency_blocked:
             return
         self._save_tab_settings()
@@ -625,6 +742,9 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
         state['keyframes'] = tuple(self.keyframe_times)
         state['index_codec'] = self.keyframe_index_codec
         state['keyframe_note'] = self.keyframe_note
+        if self.list_view:
+            _, audios = self._list_selected_formats()
+            state['audio_ids'] = [str(fmt['format_id']) for fmt in audios if fmt and fmt.get('format_id')]
         return state
 
     def _save_tab_settings(self):
@@ -666,6 +786,10 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
             self.clip_end_var.set(state['clip_end'])
             self._apply_clip_time_entries()
             self.folder_var.set(state['folder'])
+        if self.list_view and 'list_defaults' in state:
+            self._apply_format_defaults(state['list_defaults'])
+            if is_youtube_url(url):
+                self.queue_tab_settings[url] = self._capture_tab_settings()
         self._update_auto_summary()
         self._update_download_button_state()
 
@@ -677,6 +801,12 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
 
     def _render_video_tabs(self, urls):
         tabs = self.queue_tabs
+        selected = self.queue_view_url if self.queue_view_url in urls else self.active_queue_url
+        if selected not in urls:
+            selected = urls[0] if urls else None
+        show_identity = not (self.list_view and self.completed_selection)
+        if selected is None and show_identity:
+            self._set_selected_video_identity('', '', '', {}, None)
         previous_index = tabs.currentIndex()
         previous_tabs = [tabs.tabData(index) for index in range(tabs.count())]
         previous_previews = dict(previous_tabs)
@@ -687,11 +817,19 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
         tabs.blockSignals(True)
         rebuilding = [url for url, _ in previous_tabs] != urls
         if rebuilding:
-            while tabs.count():
-                tabs.removeTab(tabs.count() - 1)
-            for url in urls:
-                index = tabs.addTab('')
-                self._add_video_tab_close(index, url)
+            wanted = set(urls)
+            for index in range(len(previous_tabs) - 1, -1, -1):
+                if previous_tabs[index][0] not in wanted:
+                    tabs.removeTab(index)
+            for index, url in enumerate(urls):
+                if url not in previous_previews:
+                    tabs.insertTab(index, '')
+                    tabs.setTabData(index, (url, None))
+                    self._add_video_tab_close(index, url)
+                elif tabs.tabData(index)[0] != url:
+                    source = next(i for i in range(index + 1, tabs.count())
+                                  if tabs.tabData(i)[0] == url)
+                    tabs.moveTab(source, index)
         for index, url in enumerate(urls):
             key = (url, self.access_var.get())
             cached = self.analysis_cache.get(key)
@@ -700,7 +838,8 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
             analyzing = False
             if url == self.active_queue_url and self._transfer_busy():
                 job = self.active_download_job
-                tab_data = self.active_download_data or tab_data
+                if not self.list_view or not tab_data:
+                    tab_data = self.active_download_data or tab_data
                 if self.download_verification_pending:
                     state = "Vérification"
                 elif self.subtitle_retry_pending:
@@ -721,19 +860,33 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
             else:
                 state = "Analyse prévue"
             video_id = str(tab_data.get('id') or youtube_video_id(url))
-            title = str((job or {}).get('title') or tab_data.get('title') or '').strip()
+            job_title = (job or {}).get('title')
+            analysis_title = tab_data.get('title')
+            title = analysis_title if self.list_view and analysis_title else job_title or analysis_title
+            title = str(title or '').strip()
             preview_key = (video_id, bool(tab_data))
             if video_id and preview_key != previous_previews.get(url):
                 self._request_tab_preview(video_id, fetch_title=not title)
             title = title or self.tab_preview_titles.get(video_id or url)
-            label = f"{title} · {state}" if title else f"{state} · {self._compact_queue_url(url)}"
-            tabs.setTabData(index, (url, preview_key))
-            tabs.setAccessibleTabName(index, label)
-            tabs.setTabToolTip(index, f"{title or url}\n{state}\n{url}")
+            if preview_key != previous_previews.get(url):
+                tabs.setTabData(index, (url, preview_key))
+            tab_label = (message('%1 · %2', title, message(state)) if title else
+                         message('%1 · %2', message(state), self._compact_queue_url(url)))
+            bind_text(tabs, 'setAccessibleTabName', index, tab_label)
+            bind_text(tabs, 'setTabToolTip', index, message('%1\n%2\n%3', title or url, message(state), url))
             self._set_video_tab_preview(
                 index, title or url, state, self.thumbnail_cache.get(video_id),
                 analyzing=analyzing, downloading=state == 'Téléchargement')
-        selected = self.queue_view_url if self.queue_view_url in urls else self.active_queue_url
+            if url == selected and show_identity:
+                feedback = self._list_reanalysis_status(url) if self.list_view else ''
+                self._set_selected_video_identity(
+                    url, title or 'Vidéo en cours d’identification…', ' · '.join(filter(None, (state, feedback))),
+                    tab_data, self.thumbnail_cache.get(video_id), placeholder=not title)
+                identity = (url, title, state, self.url_var.get().strip())
+                if identity != getattr(self, '_logged_video_identity', None):
+                    self._logged_video_identity = identity
+                    log_event('ui.selection', video_id=video_id, selected_url=url,
+                              title=title, state=state, displayed_url=identity[-1])
         if tabs.count():
             tabs.setCurrentIndex(urls.index(selected) if selected in urls else 0)
         tabs.blockSignals(False)
@@ -750,13 +903,48 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
         self._video_tab_order = list(dict.fromkeys(surviving + open_urls))
         return self._video_tab_order
 
+    def _sync_download_list_order(self, urls=None):
+        if urls is None:
+            urls = self._video_tab_urls()
+        wanted = dict.fromkeys([*urls, *self.queued_downloads, *self.completed_downloads])
+        order = [url for url in self.download_list_order if url in wanted]
+        seen = set(order)
+        order.extend(url for url in wanted if url not in seen)
+        self.download_list_order = order
+        self.queued_downloads = {url: self.queued_downloads[url] for url in order if url in self.queued_downloads}
+
+    def _move_download_list_item(self, url, destination):
+        order = self.download_list_order
+        if url not in order or not 0 <= destination < len(order) or order[destination] == url:
+            return
+        order.remove(url)
+        order.insert(destination, url)
+        self._render_download_queue()
+        self._save_download_checkpoint()
+
+    def _prioritize_list_download(self, url):
+        if url not in self.queued_downloads or not self._can_prioritize_download():
+            return
+        order = self.download_list_order
+        target = min(order.index(self.active_queue_url), order.index(next(iter(self.queued_downloads))))
+        self._move_download_list_item(url, target)
+        self.priority_download_url = url
+        if self.download_retry_pending:
+            self._start_priority_download()
+        else:
+            self._pause_download()
+
     def _render_download_queue(self, *, selected_download=None):
         if not hasattr(self, "queue_tabs"):
             return
         self._update_video_view()
-        self._render_video_tabs(self._video_tab_urls())
+        urls = self._video_tab_urls()
+        if self.list_view:
+            self._sync_download_list_order(urls)
+        self._render_video_tabs(urls)
         url = self.url_var.get().strip()
         self.retry_analysis_action.setEnabled(
+            self._can_reanalyze_list_video(self.completed_selection or url) if self.list_view else
             is_youtube_url(url) and (not self._transfer_busy() or url in self.queue_analysis_errors))
         self.analysis_diagnostic_action.setEnabled(is_youtube_url(url))
 
@@ -765,7 +953,11 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
         self.pause_download_button.setVisible(self._download_can_pause())
         self.pause_download_button.setEnabled(not (self.download_pause_requested or self.cancel_requested))
         self.cancel_button.setVisible(self.download_thread is not None)
-        self._render_scheduled_downloads(selected_download)
+        if self.list_view:
+            self.download_table.refresh(self.download_list_order)
+            self._update_transfer_visibility()
+        else:
+            self._render_scheduled_downloads(selected_download)
 
     @staticmethod
     def _download_audio_characteristics(job):
@@ -860,6 +1052,7 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
 
     def _open_download_tab(self, url):
         if url in self._video_tab_urls():
+            self.completed_selection = None
             self._show_queue_tab(url)
             self._save_download_checkpoint()
 
@@ -869,6 +1062,8 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
             self.editing_queued_url = url
             self._update_video_view()
             self._update_download_button_state()
+            if self.list_view:
+                self.download_table.refresh_stream_selection()
 
     def _remove_scheduled_download(self, url):
         self.queued_downloads.pop(url, None)
@@ -925,6 +1120,7 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
 
     def _show_queue_tab(self, url):
         """Display a queue item while leaving the active transfer untouched."""
+        log_event('ui.tab_open', url=url, previous_url=self.url_var.get().strip())
         url = str(url or "").strip()
         if not url:
             return
@@ -1028,6 +1224,8 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
         self.tab_analysis_data = {key: data for key, data in self.tab_analysis_data.items() if key[0] != url}
         self.queue_analysis_waiting = [queued for queued in self.queue_analysis_waiting if queued != url]
         self.queue_analysis_errors.pop(url, None)
+        self.queue_reanalysis_waiting.discard(url)
+        self.queue_reanalysis_failed.discard(url)
         self.queue_tab_settings.pop(url, None)
         if url == self.queue_analysis_url and self.queue_analysis_orchestrator is not None:
             self.queue_analysis_orchestrator.cancel()
@@ -1104,6 +1302,15 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
         if not is_youtube_url(url):
             self.url_var.set(url)
             return
+        if self.list_view:
+            if url in self.completed_downloads and url not in self._video_tab_urls():
+                self.completed_selection = url
+                self._render_download_queue()
+                self._save_download_checkpoint()
+                return
+            self.completed_selection = None
+            if url not in self._video_tab_urls() and url not in self.queue_tab_settings:
+                self.queue_tab_settings[url] = {**self.default_tab_settings, 'list_defaults': self.download_defaults.copy()}
         current = self.active_queue_url
         if current and url != current:
             self._enqueue_url(url)
@@ -1141,6 +1348,42 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
         self.queue_analysis_waiting.append(url)
         self._start_next_queue_analysis()
 
+    def _can_reanalyze_list_video(self, url):
+        return (url in self.download_list_order and is_youtube_url(url)
+                and url != self.closing_transfer_tab_url and bool(self.ytdlp)
+                and not self.dependency_busy and not self.dependency_blocked
+                and url not in self.queue_analysis_waiting
+                and url not in (self.queue_analysis_url, self.active_analysis_key_url())
+                and not (url == self.url_var.get().strip() and self.analysis_job is not None))
+
+    def _reanalyze_list_video(self, url):
+        if not self._can_reanalyze_list_video(url):
+            return
+        self.queue_reanalysis_failed.discard(url)
+        self.queue_analysis_errors.pop(url, None)
+        self.queue_reanalysis_waiting.add(url)
+        self.queue_analysis_waiting.append(url)
+        self._start_next_queue_analysis()
+        if url != self.queue_analysis_url:
+            self._render_download_queue()
+
+    def _list_reanalysis_status(self, url):
+        if self.queue_analysis_reanalyzing and url == self.queue_analysis_url:
+            return 'Nouvelle analyse en cours…'
+        if url in self.queue_reanalysis_waiting:
+            return 'Nouvelle analyse en attente…'
+        if url in self.queue_reanalysis_failed:
+            return 'Relance de l’analyse échouée'
+        return ''
+
+    def _forget_list_reanalysis(self, url):
+        if url in self.queue_reanalysis_waiting:
+            self.queue_reanalysis_waiting.discard(url)
+            self.queue_analysis_waiting = [queued for queued in self.queue_analysis_waiting if queued != url]
+        self.queue_reanalysis_failed.discard(url)
+        if self.queue_analysis_reanalyzing and url == self.queue_analysis_url:
+            self.queue_analysis_orchestrator.cancel()
+
     def _start_next_queue_analysis(self):
         if (self.queue_analysis_orchestrator is not None or self.analysis_running
                 or (self.analysis_job is not None and not self._transfer_busy())
@@ -1149,11 +1392,13 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
             return
         while self.queue_analysis_waiting:
             url = self.queue_analysis_waiting.pop(0)
-            if url not in self.pending_urls and url != self.active_queue_url:
+            reanalyze = url in self.queue_reanalysis_waiting
+            self.queue_reanalysis_waiting.discard(url)
+            if url not in self.pending_urls and url != self.active_queue_url and not (reanalyze and url in self.completed_downloads):
                 continue
             key = (url, self.access_var.get())
             cached = self.analysis_cache.get(key)
-            if key in self.tab_analysis_data or (cached and time.monotonic() - cached[0] < 300):
+            if not reanalyze and (key in self.tab_analysis_data or (cached and time.monotonic() - cached[0] < 300)):
                 continue
             engine = WindowsEngine(self.ytdlp, self.ffmpeg)
             engine.access_strategies = self.access_strategies.copy()
@@ -1161,6 +1406,7 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
             self.queue_analysis_orchestrator = orchestrator
             self.queue_analysis_url = url
             self.queue_analysis_key = key
+            self.queue_analysis_reanalyzing = reanalyze
             orchestrator.analyze(
                 url, session=self._session_requested(),
                 fallback=self.access_var.get() == ACCESS_CHOICES[0])
@@ -1175,39 +1421,45 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
             while True:
                 event = orchestrator.next_event()
                 kind = event[0]
+                if kind not in ('analysis_ok', 'analysis_error', 'verification_required', 'analysis_cancelled'):
+                    continue
+                url, key = self.queue_analysis_url, self.queue_analysis_key
+                reanalyze = self.queue_analysis_reanalyzing
+                self.queue_analysis_orchestrator = None
+                self.queue_analysis_url = None
+                self.queue_analysis_key = None
+                self.queue_analysis_reanalyzing = False
+                if reanalyze and (url not in self.download_list_order or url == self.closing_transfer_tab_url):
+                    self._start_next_queue_analysis()
+                    return
+                record = self.completed_downloads.get(url) if reanalyze else None
+                bound_job = reanalyze and (url in self.queued_downloads or (
+                    url == self.active_queue_url and self.active_download_job))
                 if kind == "analysis_ok":
                     data = event[2]
-                    if self.queue_analysis_key:
-                        self.tab_analysis_data[self.queue_analysis_key] = data
-                        self.queue_analysis_completed.add(self.queue_analysis_key)
-                        self.analysis_cache[self.queue_analysis_key] = (
-                            time.monotonic(), data)
+                    if record:
+                        self.completed_downloads[url] = dict(record, data=self._with_video_identity(record['data'], data))
+                    elif key:
+                        self.tab_analysis_data[key] = data
+                        self.queue_analysis_completed.add(key)
+                        self.analysis_cache[key] = (time.monotonic(), data)
                         if len(self.analysis_cache) > 20:
                             self.analysis_cache.pop(next(iter(self.analysis_cache)))
-                    analyzed_url = self.queue_analysis_url
-                    self.queue_analysis_errors.pop(self.queue_analysis_url, None)
-                    self.queue_analysis_orchestrator = None
-                    self.queue_analysis_url = None
-                    self.queue_analysis_key = None
-                    if analyzed_url == self.queue_view_url:
-                        self._show_queue_tab(analyzed_url)
+                    self.queue_analysis_errors.pop(url, None)
+                    if url == self.queue_view_url and not record and not self.completed_selection:
+                        self._show_queue_tab(url)
                     self._save_download_checkpoint()
-                    self._render_download_queue()
-                    self._start_next_queue_analysis()
-                    return
-                if kind in ("analysis_error", "verification_required", "analysis_cancelled"):
+                else:
                     error = event[2] if len(event) > 2 else "Analyse interrompue"
-                    failed_url = self.queue_analysis_url
-                    if failed_url:
-                        self.queue_analysis_errors[failed_url] = str(error)
-                    self.queue_analysis_orchestrator = None
-                    self.queue_analysis_url = None
-                    self.queue_analysis_key = None
-                    if failed_url and failed_url == self.queue_view_url:
-                        self._show_queue_tab(failed_url)
-                    self._render_download_queue()
-                    self._start_next_queue_analysis()
-                    return
+                    if reanalyze:
+                        self.queue_reanalysis_failed.add(url)
+                    if url and not (reanalyze and (record or bound_job or key in self.tab_analysis_data or key in self.analysis_cache)):
+                        self.queue_analysis_errors[url] = str(error)
+                        if url == self.queue_view_url and not self.completed_selection:
+                            self._show_queue_tab(url)
+                self._render_download_queue()
+                self._start_next_queue_analysis()
+                return
         except queue.Empty:
             pass
 
@@ -1229,6 +1481,8 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
     def _activate_next_queued_url(self, *, keep_prepared=False, select_tab=True):
         if self._transfer_busy() or self.verification_thread is not None:
             return
+        if self.list_view:
+            self._sync_download_list_order()
         if self.queued_downloads:
             url = next(iter(self.queued_downloads))
             job = self.queued_downloads.pop(url)
@@ -1258,16 +1512,18 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
             self._render_download_queue()
             self._save_download_checkpoint()
             return
-        url = self.pending_urls.pop(0)
-        self.queue_analysis_waiting = [
-            queued for queued in self.queue_analysis_waiting if queued != url]
+        viewed = self.queue_view_url
+        index = self.pending_urls.index(viewed) if not select_tab and viewed in self.pending_urls else 0
+        url = self.pending_urls.pop(index)
+        if url not in self.queue_reanalysis_waiting:
+            self.queue_analysis_waiting = [queued for queued in self.queue_analysis_waiting if queued != url]
         self.active_queue_url = url
         self.queue_view_url = url
         self._render_download_queue()
         self.url_var.set(url)
         self._save_download_checkpoint()
 
-    def _finish_active_queue_item(self, *, keep_tab=False):
+    def _finish_active_queue_item(self, *, keep_tab=False, succeeded=False, partial=False):
         self.download_retry_pending = False
         self.download_verification_pending = False
         self.subtitle_retry_pending = False
@@ -1275,6 +1531,8 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
         if self._queue_finished_request is completed:
             return
         self._queue_finished_request = completed
+        if (succeeded or partial) and self.active_download_job and not self.closing_transfer_tab_url:
+            self._remember_completed_download(self.active_download_job, partial=partial)
         self.active_download_job = None
         self._save_download_checkpoint()
         if self.closing_transfer_tab_url:
@@ -1284,8 +1542,389 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
             return
         def advance():
             if self.last_download_request is completed:
-                self._activate_next_queued_url(keep_prepared=keep_tab)
+                preserve_view = self.list_view and self.queue_view_url in self.pending_urls
+                self._activate_next_queued_url(keep_prepared=keep_tab, select_tab=not preserve_view)
+                if succeeded and self._can_shutdown_after_downloads(completed):
+                    self._show_shutdown_countdown(completed)
         self.after_idle(advance)
+
+    def _remember_completed_download(self, job, *, partial=False):
+        url = job['request'][0]
+        data = self._analysis_snapshot(self.active_download_data or job['data'] or {})
+        data['title'] = job['title'] or data.get('title') or url
+        if self.list_view:
+            current = self.tab_analysis_data.get((url, self.access_var.get()), {})
+            data = self._with_video_identity(data, current)
+        selection = job['selection']
+        format_ids = [str(fmt['format_id']) for fmt in (
+            selection.get('video'), *(selection.get('audios') or [selection.get('audio')]))
+            if fmt and fmt.get('format_id') is not None]
+        total_size = 0
+        for path in self.download_results:
+            try:
+                total_size += os.path.getsize(path)
+            except OSError:
+                continue
+        self.completed_downloads[url] = {
+            'folder': self.download_result_folder or job['request'][1],
+            'paths': list(self.download_results),
+            'data': data,
+            'formats': format_ids,
+            'subtitles': (job['request'][4] or '').split(','),
+            'summary': self._queued_download_summary(job, detailed=True),
+            'size': human_size(total_size) if total_size else self._list_job_size(job),
+            'partial': partial,
+            'mode': job['request'][2],
+        }
+        if self.list_view and self.download_table.selected_url() == url:
+            self.completed_selection = url
+
+    def _with_video_identity(self, saved, analyzed):
+        identity = {key: analyzed[key] for key in ('id', 'title', 'duration') if analyzed.get(key) is not None}
+        return {**saved, **identity, **self._video_description_snapshot(analyzed)}
+
+    def _list_job_size(self, job):
+        _, _, mode, _, subtitles, _, clip = job['request']
+        return self._list_size(job['selection'], mode, (job['data'] or {}).get('duration'), clip, bool(subtitles))
+
+    @staticmethod
+    def _list_size(selection, mode, duration, clip, subtitles):
+        size = estimate_size_label(selection, mode, duration, clip, subtitles).removeprefix('Taille estimée : ')
+        return size if size.startswith('≈') else '—'
+
+    def _list_prepare_again(self, url):
+        if url not in self.completed_downloads:
+            return
+        self.completed_downloads.pop(url)
+        self.completed_selection = None
+        self._clear_download_result_actions()
+        self._url_link_submitted(url)
+        self._open_download_tab(url)
+        self._update_download_button_state()
+
+    @staticmethod
+    def _normalize_format_defaults(values):
+        if not isinstance(values, dict):
+            values = {}
+        container, video, audio = (values.get(key) for key in ('container', 'video', 'audio'))
+        subtitles = values.get('subtitles')
+        language_choices = ('original', *LANGUAGE_NAMES)
+        return {
+            'container': container if container in ('Auto', 'MP4', 'MKV', 'WebM', 'M4A', 'MKA') else 'Auto',
+            'video': video if video in ('auto', 'off', '360', '480', '720', '1080', '1440', '2160', '4320') else 'auto',
+            'audio': audio if audio in ('off', *language_choices) else 'original',
+            'subtitles': list(dict.fromkeys(code for code in subtitles if code in language_choices))
+            if isinstance(subtitles, list) else [],
+        }
+
+    def _read_format_defaults(self):
+        try:
+            values = json.loads(self.preferences.value('format_defaults', '{}'))
+        except (ValueError, TypeError):
+            values = {}
+        return self._normalize_format_defaults(values)
+
+    def _save_format_defaults(self, values):
+        self.download_defaults = self._normalize_format_defaults(values)
+        self.preferences.setValue('format_defaults', json.dumps(self.download_defaults))
+        self.preferences.sync()
+
+    @staticmethod
+    def _default_media_mode(defaults, has_audio):
+        if defaults['video'] == 'off':
+            return 'subtitles' if defaults['audio'] == 'off' or (defaults['subtitles'] and not has_audio) else 'audio'
+        return 'video_only' if defaults['audio'] == 'off' else 'video'
+
+    @staticmethod
+    def _default_automatic_settings(defaults):
+        return (defaults['container'] == 'Auto' and not defaults['video'].isdecimal()
+                and defaults['audio'] in ('original', 'off'))
+
+    def _list_default_streams(self, data, defaults):
+        catalog = MediaCatalog.from_analysis(data)
+        mode = self._default_media_mode(defaults, bool(catalog.audio_formats))
+        automatic = self._default_automatic_settings(defaults)
+        original, _, inferred = data.get('_saved_language_info') or original_language_info(data)
+        container = defaults['container']
+        if container not in self._mode_containers(mode):
+            container = 'Auto'
+        video = None
+        if mode in ('video', 'video_only'):
+            height = f"{defaults['video']}p" if defaults['video'].isdecimal() else ''
+            options = video_options(catalog.videos_by_height, mode, container, automatic, height, None, 'H.264')
+            video = max(options.formats, key=lambda fmt: (fmt.get('acodec') == 'none', codec_rank(fmt)), default=None)
+        audios = []
+        if mode in ('video', 'audio'):
+            options = audio_options(catalog.audio_formats, mode, container, automatic, original)
+            if options:
+                preferred = self._preferred_audio_format(
+                    fmt for fmt in options if language_base(fmt.get('language')) == defaults['audio'])
+                choice = preferred or options[0]
+                codec = codec_name(choice.get('acodec'))
+                language = self._audio_label_for_language(choice, original)
+                rate = self._audio_rate_label(choice)
+                audios = [self._preferred_audio_format(fmt for fmt in options if (
+                    codec_name(fmt.get('acodec')) == codec and self._audio_rate_label(fmt) == rate
+                    and self._audio_label_for_language(fmt, original) == language))]
+        subtitles = []
+        if defaults['subtitles'] and mode != 'audio':
+            tracks = data.get('_saved_subtitle_tracks')
+            if tracks is None:
+                tracks = subtitle_choices(data, None if inferred else original)
+            subtitles = self._list_default_subtitle_codes(defaults['subtitles'], tracks=tracks)
+        return mode, video, audios, subtitles
+
+    def _apply_format_defaults(self, values):
+        defaults = self._normalize_format_defaults(values)
+        mode, video, audios, subtitles = self._list_default_streams(self.analysis_data, defaults)
+        container = defaults['container']
+        self.settings_var.set('auto' if self._default_automatic_settings(defaults) else 'manual')
+        self.mode_var.set(mode)
+        self._mode_changed()
+        if container in self.container_combo['values'] and container != 'Auto':
+            self.container_var.set(container)
+        if video:
+            height, fps = video['height'], video.get('fps')
+            self.height_var.set(f'{height}p · {fps:g} i/s' if fps else f'{height}p · cadence inconnue')
+            self.codec_var.set(codec_name(video.get('vcodec')))
+        self._refresh_resolution_choices()
+        if video:
+            index = next((i for i, fmt in enumerate(self.video_display_formats) if fmt == video), None)
+            if index is not None:
+                self.resolution_combo.current(index)
+        if audios:
+            audio = audios[0]
+            label = self._audio_language_label(audio)
+            self.audio_codec_var.set(codec_name(audio.get('acodec')))
+            self.audio_rate_var.set(self._audio_rate_label(audio))
+            self.selected_audio_language_labels = [label]
+            self.audio_language_var.set(label)
+            self._sync_audio_options(choose=True)
+        if subtitles or mode in ('video', 'video_only'):
+            self._set_selected_subtitles(subtitles)
+
+    def _list_default_subtitle_codes(self, languages, *, tracks=None):
+        tracks = self.subtitle_tracks if tracks is None else tracks
+        codes = []
+        for language in languages:
+            matches = [track for track in tracks if (
+                track.get('original') if language == 'original' else language_base(track['code']) == language)]
+            if matches:
+                best = min(matches, key=lambda track: (not track.get('original'), bool(track.get('kind')),
+                                                       track.get('kind') == 'traduction auto'))
+                codes.append(best['code'])
+        return codes
+
+    def _list_selected_formats(self):
+        selection = self._selection()
+        if selection is not None:
+            return selection.get('video'), selection.get('audios') or ()
+        mode = self.mode_var.get()
+        video = self._selected_video() if mode in ('video', 'video_only') else None
+        return video, self._selected_audios() if mode in ('video', 'audio') else ()
+
+    def _list_can_configure(self, url):
+        job = self.queued_downloads.get(url)
+        return bool(url and url == self.queue_view_url and self.analysis_data and not self.completed_selection
+                    and not (url == self.active_queue_url and self.active_download_job)
+                    and not (job and job.get('partial_path')))
+
+    def _list_start_editing(self, url):
+        if not self._list_can_configure(url):
+            return False
+        if url in self.queued_downloads and self.editing_queued_url != url:
+            self._edit_queued_video()
+        return True
+
+    def _list_media_mode(self, kind, include):
+        mode = self.mode_var.get()
+        can_split_video = self.mode_buttons['video_only'].isEnabled()
+        if kind == 'video':
+            if include:
+                candidate = 'video' if mode == 'audio' or not can_split_video else 'video_only'
+            elif mode == 'video' and self.audio_formats:
+                candidate = 'audio' if not self._selected_subtitle() else None
+            else:
+                candidate = 'subtitles'
+        else:
+            candidate = ('video' if mode == 'video_only' else 'audio') if include else (
+                'video_only' if mode == 'video' else 'subtitles')
+            if include and candidate == 'video' and not self.audio_formats and not any(
+                    fmt.get('acodec') not in (None, 'none')
+                    for formats in self.formats_by_height.values() for fmt in formats):
+                return None
+        return candidate if {
+            'video': bool(self.formats_by_height),
+            'video_only': can_split_video,
+            'audio': bool(self.audio_formats),
+            'subtitles': True,
+        }.get(candidate) else None
+
+    def _list_can_toggle_group(self, kind, include):
+        if kind == 'subtitle':
+            return bool(self.subtitle_tracks) and self.mode_var.get() != 'audio'
+        return self._list_media_mode(kind, include) is not None
+
+    def _list_toggle_group(self, url, kind, include):
+        if not self._list_can_toggle_group(kind, include) or not self._list_start_editing(url):
+            return
+        if kind == 'subtitle':
+            codes = []
+            if include:
+                codes = self._list_default_subtitle_codes(self.download_defaults['subtitles']) or self._selected_subtitle_codes()
+                if not codes:
+                    codes = [self.subtitle_tracks[0]['code']]
+            self._set_selected_subtitles(codes)
+        else:
+            mode = self._list_media_mode(kind, include)
+            subtitles = self._selected_subtitle_codes() if self._selected_subtitle() else ()
+            self._select_mode(mode)
+            if mode != 'audio':
+                self._set_selected_subtitles(subtitles)
+        self._save_download_checkpoint()
+
+    def _list_set_container(self, index):
+        url = self.queue_view_url
+        if not self._list_start_editing(url):
+            return
+        self.settings_var.set('manual')
+        self.container_var.set(self.container_combo.sourceText(index))
+        self._refresh_resolution_choices()
+        self._save_download_checkpoint()
+
+    def _list_editable_streams(self):
+        if not self.analysis_data:
+            return set()
+        mode = self.mode_var.get()
+        container = self.container_var.get()
+        video = self._selected_video() if mode == 'video' else None
+        key = (id(self.analysis_data), mode, container, (video or {}).get('format_id'))
+        cached = getattr(self, '_list_stream_options', None)
+        if cached and cached[0] == key:
+            return cached[1]
+        options = set()
+        if mode in ('video', 'video_only'):
+            for height, formats in self.formats_by_height.items():
+                profiles = {(fmt.get('fps') or 0, codec_name(fmt.get('vcodec'))) for fmt in formats}
+                for fps, codec in profiles:
+                    label = f'{height}p · {fps:g} i/s' if fps else f'{height}p · cadence inconnue'
+                    plan = video_options({height: formats}, mode, container, False, label, height, codec)
+                    options.update(('video', str(fmt['format_id'])) for fmt in plan.formats if fmt.get('format_id'))
+        video_has_audio = video and video.get('acodec') not in (None, 'none')
+        if mode in ('video', 'audio') and (not video_has_audio or self._list_video_without_audio(video)):
+            grouped = {}
+            for fmt in audio_options(self.audio_formats, mode, container, False, self.original_language):
+                group = (codec_name(fmt.get('acodec')), self._audio_language_label(fmt), self._audio_rate_label(fmt))
+                grouped.setdefault(group, []).append(fmt)
+            options.update(('audio', str(fmt['format_id'])) for group in grouped.values()
+                           if (fmt := self._preferred_audio_format(group)) and fmt.get('format_id'))
+        if mode in ('video', 'video_only', 'subtitles'):
+            options.update(('subtitle', track['code']) for track in self.subtitle_tracks)
+        self._list_stream_options = key, options
+        return options
+
+    def _list_choose_stream(self, url, key, checked):
+        if key not in self._list_editable_streams() or not self._list_start_editing(url):
+            return
+        kind, identifier = key
+        if kind == 'subtitle':
+            codes = set(self._selected_subtitle_codes())
+            if checked:
+                codes.add(identifier)
+            else:
+                codes.discard(identifier)
+            self._set_selected_subtitles(codes)
+        elif kind == 'video':
+            if not checked:
+                self._list_toggle_group(url, kind, False)
+                return
+            fmt = next(fmt for formats in self.formats_by_height.values() for fmt in formats
+                       if str(fmt.get('format_id')) == identifier)
+            self._list_choose_video(fmt)
+            self._update_download_button_state()
+        elif kind == 'audio':
+            _, audios = self._list_selected_formats()
+            if not checked and len(audios) == 1 and str(audios[0].get('format_id')) == identifier:
+                self._list_toggle_group(url, kind, False)
+                return
+            self._list_choose_audio(identifier, checked)
+        self._save_download_checkpoint()
+
+    def _list_choose_video(self, fmt):
+        self.settings_var.set('manual')
+        height, fps = fmt['height'], fmt.get('fps')
+        self.height_var.set(f'{height}p · {fps:g} i/s' if fps else f'{height}p · cadence inconnue')
+        self.codec_var.set(codec_name(fmt.get('vcodec')))
+        self._refresh_resolution_choices()
+        for index, option in enumerate(self.video_display_formats):
+            if option['format_id'] == fmt['format_id']:
+                self.resolution_combo.current(index)
+                break
+
+    def _list_video_without_audio(self, video):
+        height = int(video['height'])
+        candidates = [fmt for fmt in self.formats_by_height.get(height, ())
+                      if fmt.get('acodec') in (None, 'none')
+                      and codec_name(fmt.get('vcodec')) == codec_name(video.get('vcodec'))
+                      and (fmt.get('fps') or 0) == (video.get('fps') or 0)
+                      and (fmt.get('dynamic_range') or '') == (video.get('dynamic_range') or '')
+                      and format_fits_container(fmt, self.container_var.get())]
+        return max(candidates, key=lambda fmt: (fmt.get('protocol') == 'https', fmt.get('tbr') or 0),
+                   default=None)
+
+    def _list_choose_audio(self, identifier, checked):
+        fmt = next(fmt for fmt in self.audio_formats if str(fmt.get('format_id')) == identifier)
+        codec = codec_name(fmt.get('acodec'))
+        label = self._audio_language_label(fmt)
+        labels = list(self._selected_audio_language_labels()) if codec == self.audio_codec_var.get() else []
+        if checked and label not in labels:
+            labels.append(label)
+        elif not checked and label in labels and len(labels) > 1:
+            labels.remove(label)
+        elif not checked:
+            return
+        self.settings_var.set('manual')
+        video = self._selected_video() if self.mode_var.get() == 'video' else None
+        alternative = (self._list_video_without_audio(video) if video
+                       and video.get('acodec') not in (None, 'none') else None)
+        if alternative:
+            self._list_choose_video(alternative)
+        else:
+            self._refresh_resolution_choices()
+        self.audio_codec_var.set(codec)
+        self.audio_rate_var.set(self._audio_rate_label(fmt))
+        self.selected_audio_language_labels = labels
+        self.audio_language_var.set(labels[0])
+        self._audio_options_changed()
+
+    def _can_shutdown_after_downloads(self, completed):
+        return (self.shutdown_after_downloads_check.isChecked()
+                and not self._closing and not self._disposed
+                and self.last_download_request is completed
+                and self.active_download_job is None and not self.queued_downloads
+                and not self._transfer_busy())
+
+    def _show_shutdown_countdown(self, completed):
+        if self._shutdown_dialog is not None:
+            return
+        dialog = ShutdownCountdown(self)
+        self._shutdown_dialog = dialog
+
+        def finished(result):
+            self._shutdown_dialog = None
+            dialog.deleteLater()
+            shutdown = (result == QDialog.DialogCode.Accepted
+                        and self._can_shutdown_after_downloads(completed))
+            self.shutdown_after_downloads_check.setChecked(False)
+            if shutdown:
+                self._save_download_checkpoint(flush=True)
+                try:
+                    shutdown_windows()
+                except (OSError, subprocess.SubprocessError):
+                    messagebox.showerror(APP_TITLE, 'Windows n’a pas pu lancer l’arrêt de l’ordinateur.')
+
+        dialog.finished.connect(finished)
+        dialog.open()
 
     def _on_url_changed(self, *_):
         if self._queue_tab_switching or self._transfer_busy():
@@ -1343,7 +1982,7 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
         self.audio_var.set("")
         self.audio_language_summary_var.set("Aucune")
         self.subtitle_var.set("Aucun")
-        self.subtitle_combo.setToolTip("Cliquez pour choisir une ou plusieurs langues.")
+        bind_text(self.subtitle_combo, 'setToolTip', "Cliquez pour choisir une ou plusieurs langues.")
         self._configure_clip_controls(None)
         self.resolution_heights = []
         self.video_display_formats = []
@@ -1421,6 +2060,7 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
 
 
     def _process_analysis(self, data):
+        log_event('ui.catalog_displayed', url=self.url_var.get().strip(), catalog=catalog_summary(data))
         self.analysis_data = data
         url = self.url_var.get().strip()
         if is_youtube_url(url):
@@ -1566,11 +2206,14 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
         muxed = [f for f in formats if f.get("vcodec") not in (None, "none") and f.get("acodec") not in (None, "none")]
         codecs = ", ".join(sorted({codec_name(f.get("acodec")) for f in audio+muxed})) or "aucun reçu"
         lang, source, inferred = data.get('_saved_language_info') or original_language_info(data)
+        access = ("Secours sans BgUtils" if data.get("_downloader_access_recovery") == "without_provider"
+                  else "BgUtils PO Token Provider 2.0.0, exécuté à la demande")
         return "\n".join([
             self._selection_status(), "", f"Pistes audio séparées reçues : {len(audio)}",
             f"Flux vidéo avec audio intégré : {len(muxed)}", f"Codecs audio reçus : {codecs}",
             f"Flux vidéo reçus : {sum(f.get('vcodec') not in (None, 'none') for f in formats)}",
-            f"Langue : {language_label(lang)}", "Accès : BgUtils PO Token Provider 2.0.0, exécuté à la demande", f"Source de la langue : {source}" + (" (origine non confirmée)" if inferred else ""),
+            f"Langue : {language_label(lang)}", f"Accès : {access}", f"Source de la langue : {source}" + (" (origine non confirmée)" if inferred else ""),
+            "", f"Journal détaillé : {log_path() or 'non activé dans cette session de test'}",
             "", "Messages yt-dlp :", self.analysis_diagnostics or "Aucun avertissement reçu.",
             "", "L’absence d’un format ou d’une langue ne prouve pas un contrôle antirobot.",
             "Une demande explicite de confirmation antirobot permet de l’identifier. HTTP 429 indique une limitation ; HTTP 403 un refus d’accès.",
@@ -1673,15 +2316,19 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
         }
         for mode, enabled in available.items():
             self.mode_buttons[mode].setEnabled(enabled)
-        if not available.get(self.mode_var.get(), True):
+        if not self.list_view and not available.get(self.mode_var.get(), True):
             self.mode_var.set("video")
             self.container_combo["values"] = ("Auto", "MP4", "MKV", "WebM")
             if self.container_var.get() not in self.container_combo["values"]:
                 self.container_var.set("Auto")
 
+    @staticmethod
+    def _mode_containers(mode):
+        return ("Auto", "MP4", "MKV", "WebM") if mode in ("video", "video_only") else ("Auto", "M4A", "MKA", "WebM")
+
     def _mode_changed(self):
         self._sync_type_availability()
-        choices = ("Auto", "MP4", "MKV", "WebM") if self.mode_var.get() in ("video", "video_only") else ("Auto", "M4A", "MKA", "WebM")
+        choices = self._mode_containers(self.mode_var.get())
         self.container_combo["values"] = choices
         if self.container_var.get() not in choices:
             self.container_var.set("Auto")
@@ -1786,7 +2433,7 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
         videos = plan.formats
         codec_help = CODEC_HELP.get(self.codec_var.get(), self.codec_var.get())
         self.format_help_var.set(codec_help)
-        self.codec_combo.setToolTip(codec_help)
+        bind_text(self.codec_combo, 'setToolTip', codec_help)
         self.video_display_formats = videos
         self.resolution_heights = [int(f["height"]) for f in videos]
         values = []
@@ -1874,8 +2521,7 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
                 summary += "…"
         self.audio_language_summary_var.set(summary)
         if hasattr(self, "audio_language_picker"):
-            self.audio_language_picker.setToolTip(
-                "\n".join(selected)
+            bind_text(self.audio_language_picker, 'setToolTip', "\n".join(selected)
                 if selected else "Cliquez pour choisir une ou plusieurs langues audio.")
 
     def _selected_audios(self):
@@ -1898,14 +2544,18 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
                 item for item in candidates
                 if self._audio_rate_label(item) == rate]
             pool = exact or candidates
-            choice = max(pool, key=lambda item: (
-                item.get("language_preference") or 0,
-                item.get("protocol") == "https",
-                "drc" not in str(item.get("format_id")),
-                audio_bitrate(item) or 0), default=None)
+            choice = self._preferred_audio_format(pool)
             if choice is not None:
                 selected.append(choice)
         return selected
+
+    @staticmethod
+    def _preferred_audio_format(formats):
+        return max(formats, key=lambda item: (
+            item.get('language_preference') or 0,
+            item.get('protocol') == 'https',
+            'drc' not in str(item.get('format_id')),
+            audio_bitrate(item) or 0), default=None)
 
     @staticmethod
     def _audio_rate_label(fmt):
@@ -1913,6 +2563,10 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
         return f"{rate:.0f} kbit/s" if rate else "Débit inconnu"
 
     def _audio_language_label(self, fmt):
+        return self._audio_label_for_language(fmt, self.original_language)
+
+    @staticmethod
+    def _audio_label_for_language(fmt, original_language):
         language = fmt.get("language")
         label = language_label(language)
         kind = audio_content_type(fmt)
@@ -1922,7 +2576,7 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
             label += " — doublage"
         elif kind == "descriptive":
             label += " — audiodescription"
-        elif kind == "original" or (self.original_language and language_base(language) == language_base(self.original_language)):
+        elif kind == "original" or (original_language and language_base(language) == language_base(original_language)):
             label += " — langue d’origine"
         return label
 
@@ -2041,8 +2695,7 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
         self.subtitle_var.set(summary)
         if hasattr(self, "subtitle_combo"):
             labels = [track.get("tooltip", track["label"]) for track in self.subtitle_tracks if track["code"] in selected]
-            self.subtitle_combo.setToolTip(
-                "\n".join(labels) if labels else "Cliquez pour choisir une ou plusieurs langues.")
+            bind_text(self.subtitle_combo, 'setToolTip', "\n".join(labels) if labels else "Cliquez pour choisir une ou plusieurs langues.")
         if refresh:
             self.status_var.set(self._selection_status())
             self._update_auto_summary()
@@ -2070,11 +2723,12 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
             and not self.keyframe_loading
             and self.verification_thread is None
         )
-        self.download_button.setText(
-            'Mettre à jour la file' if url in self.queued_downloads else
+        bind_text(self.download_button, 'setText', 'Mettre à jour la file' if url in self.queued_downloads else
             'Ajouter à la file' if viewing_other else 'Télécharger')
         self.download_button.setEnabled(ready)
         self._render_dependencies()
+        if self.list_view:
+            self.download_table.schedule_stream_refresh()
 
     def _update_size(self):
         self.size_var.set(estimate_size_label(
@@ -2130,25 +2784,22 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
             self.keyframe_index_button.setVisible(video_mode)
             self.keyframe_index_button.setEnabled(available and not self.keyframe_loading and not indexed)
             if self.keyframe_loading:
-                self.keyframe_index_button.setText(
-                    self.keyframe_progress_text or "Connexion à YouTube")
+                bind_text(self.keyframe_index_button, 'setText', self.keyframe_progress_text or "Connexion à YouTube")
                 self.keyframe_index_button.setProgress(self.keyframe_progress_value)
                 self.keyframe_index_button.setIndeterminate(
                     self.keyframe_progress_value is None)
             elif indexed:
-                self.keyframe_index_button.setText("Index chargé")
+                bind_text(self.keyframe_index_button, 'setText', "Index chargé")
                 self.keyframe_index_button.setIndeterminate(False)
                 self.keyframe_index_button.setProgress(None)
             elif self.keyframe_note.startswith("Index distant indisponible"):
                 size = self._keyframe_source_size()
-                self.keyframe_index_button.setText(
-                    "Réessayer l’index" + (f" · ≈ {human_size(size)}" if size else ""))
+                bind_text(self.keyframe_index_button, 'setText', "Réessayer l’index" + (f" · ≈ {human_size(size)}" if size else ""))
                 self.keyframe_index_button.setIndeterminate(False)
                 self.keyframe_index_button.setProgress(None)
             else:
                 size = self._keyframe_source_size()
-                self.keyframe_index_button.setText(
-                    "Télécharger l’index" + (f" · ≈ {human_size(size)}" if size else ""))
+                bind_text(self.keyframe_index_button, 'setText', "Télécharger l’index" + (f" · ≈ {human_size(size)}" if size else ""))
                 self.keyframe_index_button.setIndeterminate(False)
                 self.keyframe_index_button.setProgress(None)
         if video_mode and available and not indexed and not self.keyframe_loading and not self.keyframe_note:
@@ -2244,12 +2895,17 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
         self.clip_slider.setSelection(round(start * 1000), round(end * 1000))
 
     def _close_app(self):
+        log_event('ui.close_requested', download_active=self.download_thread is not None,
+                  queued_downloads=len(self.queued_downloads), tabs=len(self._video_tab_urls()))
+        self.shutdown_after_downloads_check.setChecked(False)
+        if self._shutdown_dialog is not None:
+            self._shutdown_dialog.reject()
         self.dependency_manager.cancel.set()
         if self.dependency_busy:
             self.dependency_summary_var.set("Arrêt de l’opération en cours…")
             self.after(100, self._close_app)
             return
-        self._save_download_checkpoint()
+        self._save_download_checkpoint(flush=True)
         self.verification_cancel.set()
         if self.queue_analysis_orchestrator is not None:
             self.queue_analysis_orchestrator.cancel()
@@ -2317,7 +2973,7 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
         self.cancel_requested = False
         self._start_download_progress(progress)
         self._reset_download_log("Connexion à YouTube avec la session vérifiée.")
-        self.cancel_button.setText("Annuler")
+        bind_text(self.cancel_button, 'setText', "Annuler")
         self.cancel_button.setEnabled(True)
         self.download_thread = self.orchestrator.download(DownloadRequest(
             request[0], request[1], request[2], request[3], request[4],
@@ -2327,6 +2983,7 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
 
 
     def _start_download(self):
+        log_event('ui.download_requested', url=self.url_var.get().strip())
         url = self.url_var.get().strip()
         if self._transfer_busy() and url == self.active_queue_url:
             return
@@ -2408,6 +3065,8 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
         self._queue_or_launch_job(job)
 
     def _queue_or_launch_job(self, job):
+        if self._shutdown_dialog is not None:
+            self._shutdown_dialog.reject()
         url = job['request'][0]
         if self.editing_queued_url == url:
             self.editing_queued_url = None
@@ -2424,6 +3083,9 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
     def _launch_download_request(self, job, *, progress=0.0, select_tab=True):
         request = job['request']
         url, folder, mode, fmt, subtitle_lang, merge_format, clip = request
+        self.completed_downloads.pop(url, None)
+        if self.completed_selection == url:
+            self.completed_selection = None
         sel = job['selection']
         self.active_download_job = job
         self.download_retry_pending = False
@@ -2443,7 +3105,7 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
         self._start_download_progress(progress)
         self._reset_download_log("Connexion à YouTube.")
         self.download_button.setEnabled(False)
-        self.cancel_button.setText("Annuler")
+        bind_text(self.cancel_button, 'setText', "Annuler")
         self.cancel_button.setEnabled(True)
         if url in self.pending_urls:
             self.pending_urls.remove(url)
@@ -2492,6 +3154,8 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
 
     def _start_download_progress(self, progress):
         self.download_progress_value = progress
+        self.list_transfer_eta = None
+        self.list_transfer_speed = None
         self.download_progress.setFormat("%p %")
         self.download_progress.configure(
             mode='determinate' if progress else 'indeterminate', value=progress)
@@ -2559,6 +3223,7 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
                 and not self.subtitle_retry_pending)
 
     def _pause_download(self):
+        log_event('ui.pause_requested', url=self._current_download_url())
         if not self._download_can_pause() or self.download_pause_requested or self.cancel_requested:
             return
         self.download_pause_requested = True
@@ -2570,6 +3235,7 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
         self._save_download_checkpoint()
 
     def _cancel_download(self):
+        log_event('ui.cancel_requested', url=self._current_download_url())
         if not self.download_thread or self.download_pause_requested:
             return
 
@@ -2579,7 +3245,7 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
         self.orchestrator.cancel()
         self._save_download_checkpoint()
         self.cancel_button.setEnabled(False)
-        self.cancel_button.setText("Annulation…")
+        bind_text(self.cancel_button, 'setText', "Annulation…")
         self._append_download_detail(
             "Annulation demandée : arrêt de la connexion et des traitements en cours.")
 
@@ -2621,10 +3287,12 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
                 results.append(candidate)
         return results
 
-    def _open_download_result(self):
-        path = next((item for item in self.download_results if os.path.isfile(item)), None)
+    def _open_download_result(self, record=None):
+        paths = (self._safe_download_results(record['paths'], record['folder'])
+                 if record else self.download_results)
+        path = next((item for item in paths if os.path.isfile(item)), None)
         if not path:
-            self._reveal_download_result()
+            self._reveal_download_result(record)
             return
         try:
             if os.name == 'nt': os.startfile(path)
@@ -2632,9 +3300,11 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
         except Exception as error:
             messagebox.showerror(APP_TITLE,f'Impossible d’ouvrir le fichier :\n{error}')
 
-    def _reveal_download_result(self):
-        path = next((item for item in self.download_results if os.path.isfile(item)), None)
-        folder = os.path.dirname(path) if path else self.download_result_folder
+    def _reveal_download_result(self, record=None):
+        paths = (self._safe_download_results(record['paths'], record['folder'])
+                 if record else self.download_results)
+        path = next((item for item in paths if os.path.isfile(item)), None)
+        folder = os.path.dirname(path) if path else (record['folder'] if record else self.download_result_folder)
         try:
             if os.name == 'nt' and path:
                 subprocess.Popen(['explorer.exe','/select,',path],creationflags=CREATE_NO_WINDOW)
@@ -2666,7 +3336,7 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
                 self.failed_subtitle_missing):
             self._retry_failed_subtitles()
         else:
-            self._finish_active_queue_item()
+            self._finish_active_queue_item(partial=bool(self.download_results))
 
     def _retry_failed_subtitles(self):
         request = self.failed_subtitle_request
@@ -2678,9 +3348,9 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
         self._start_download_progress(0.0)
         self._reset_download_log(
             "Nouvelle série d’essais auprès de YouTube pour les sous-titres.")
-        self.download_button.setText("Sous-titres…")
+        bind_text(self.download_button, 'setText', "Sous-titres…")
         self.download_button.setEnabled(False)
-        self.cancel_button.setText("Annuler")
+        bind_text(self.cancel_button, 'setText', "Annuler")
         self.cancel_button.setEnabled(True)
         self.download_thread = self.orchestrator.download(DownloadRequest(
             request[0], request[1], request[2], request[3], request[4],
@@ -2693,6 +3363,8 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
             while True:
                 event = self.orchestrator.next_event()
                 kind = event[0]
+                if kind.startswith(('dependency', 'dependencies', 'verification')):
+                    log_event('ui.event', kind=kind)
 
                 if self.closing_transfer_tab_url and (
                         kind == 'download_error' or (kind == 'verification_required' and event[1] is None)):
@@ -2761,14 +3433,20 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
                     self.thumbnail_pending.discard(video_id)
                     if content:
                         self._remember_tab_preview(self.thumbnail_cache, video_id, content)
-                        self._render_video_tabs(self._video_tab_urls())
-                        self._update_download_queue_thumbnail(video_id, content)
+                        if self.list_view:
+                            self._render_download_queue()
+                        else:
+                            self._render_video_tabs(self._video_tab_urls())
+                            self._update_download_queue_thumbnail(video_id, content)
 
                 elif kind == "tab_preview_title":
                     _, video_id, title = event
                     self._remember_tab_preview(self.tab_preview_titles, video_id, title)
                     if title:
-                        self._render_video_tabs(self._video_tab_urls())
+                        if self.list_view:
+                            self._render_download_queue()
+                        else:
+                            self._render_video_tabs(self._video_tab_urls())
 
                 elif kind == "verification_note":
                     _, token, message = event
@@ -3022,10 +3700,14 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
                             self._save_download_checkpoint()
                     if not self.download_pause_requested:
                         remaining = estimate[0] if estimate else None
+                        self.list_transfer_eta = remaining
+                        self.list_transfer_speed = estimate[1] if len(estimate) > 1 else None
                         self.download_progress.setFormat(
                             "%p % · " + remaining_time_label(remaining) if remaining else "%p %")
                         self.progress_text_var.set(details)
                     self._update_tab_download_progress()
+                    if self.list_view:
+                        self.download_table.refresh_progress()
 
                 elif kind == "download_phase":
                     _, text = event
@@ -3141,7 +3823,7 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
                     self._set_subtitle_retry_available(False)
                     self._show_download_result_actions(
                         combined, self.download_result_folder or folder)
-                    self._finish_active_queue_item()
+                    self._finish_active_queue_item(succeeded=not self.cancel_requested)
 
                 elif kind == "download_done":
                     self.download_progress.stop()
@@ -3150,7 +3832,7 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
                     self.progress_text_var.set("Téléchargement terminé")
                     self._append_download_detail(
                         "Téléchargement, assemblage et métadonnées terminés.")
-                    self.cancel_button.setText("Annuler")
+                    bind_text(self.cancel_button, 'setText', "Annuler")
                     self.cancel_button.setEnabled(False)
                     self.download_thread = None
                     paths = event[1] if len(event) > 1 else []
@@ -3163,13 +3845,13 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
                         self._set_subtitle_retry_available(True)
                         self.after_idle(self._offer_failed_subtitle_retry)
                     else:
-                        self._finish_active_queue_item()
+                        self._finish_active_queue_item(succeeded=not self.cancel_requested)
 
                 elif kind == "download_cancelled":
                     self.download_progress.stop()
                     self.download_progress.configure(mode="determinate")
                     self._append_download_detail("Téléchargement annulé.")
-                    self.cancel_button.setText("Annuler")
+                    bind_text(self.cancel_button, 'setText', "Annuler")
                     self.cancel_button.setEnabled(False)
                     self.download_thread = None
                     self.progress_text_var.set("")
@@ -3184,7 +3866,7 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
                     _, error = event
                     self.progress_text_var.set("Erreur")
                     self._append_download_detail(f"Échec : {error}")
-                    self.cancel_button.setText("Annuler")
+                    bind_text(self.cancel_button, 'setText', "Annuler")
                     self.cancel_button.setEnabled(False)
                     self.download_thread = None
                     self._update_download_button_state()
@@ -3200,6 +3882,7 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
 
 
 if __name__ == "__main__":
-    app = YoutubeDownloaderApp()
+    setup_logging(app_dir())
+    app = YoutubeDownloaderApp(list_view='--onglets' not in sys.argv)
     app.show()
     raise SystemExit(application().exec())
