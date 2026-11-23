@@ -84,25 +84,77 @@ def language_label(code):
     return f"{LANGUAGE_NAMES.get(language_base(code), code)} ({code})" if code else "non déterminée"
 
 
+_AUDIO_ROLE_NOTES = {
+    "dubbed-auto": r"\bdubbed-auto\b|\bauto[ -]dubbed\b|\bautomatically dubbed\b",
+    "descriptive": r"\bdescriptive\b",
+    "dubbed": r"\bdubbed\b",
+    "original": r"\boriginal\b",
+}
+
+
+def _audio_role_from_url(url):
+    query = parse_qs(urlparse(url or '').query)
+    for tags in query.get('xtags', []):
+        for tag in tags.split(':'):
+            name, _, value = tag.partition('=')
+            if name == 'acont' and value in _AUDIO_ROLE_NOTES:
+                return value
+    return None
+
+
+def _audio_role_from_note(fmt):
+    note = (fmt.get('format_note') or '').lower()
+    return next((role for role, pattern in _AUDIO_ROLE_NOTES.items()
+                 if re.search(pattern, note)), None)
+
+
 def audio_content_type(fmt):
     """Read YouTube's explicit audio marker; another language alone is not proof of auto dubbing."""
-    saved_type = fmt.get('_downloader_audio_content_type')
-    if saved_type:
-        return saved_type
-    for key in ('url', 'manifest_url'):
-        query = parse_qs(urlparse(fmt.get(key) or '').query)
-        for tags in query.get('xtags', []):
-            for tag in tags.split(':'):
-                name, separator, value = tag.partition('=')
-                if separator and name == 'acont' and value in ('original', 'dubbed-auto', 'dubbed', 'descriptive'):
-                    return value
-    note = (fmt.get('format_note') or '').lower()
-    if re.search(r'\bdubbed-auto\b|\bauto[ -]dubbed\b|\bautomatically dubbed\b', note):
-        return 'dubbed-auto'
-    if re.search(r'\bdescriptive\b', note): return 'descriptive'
-    if re.search(r'\bdubbed\b', note): return 'dubbed'
-    if re.search(r'\boriginal\b', note): return 'original'
-    return None
+    return (fmt.get('_downloader_audio_content_type') or _audio_role_from_url(fmt.get('url'))
+            or _audio_role_from_url(fmt.get('manifest_url')) or _audio_role_from_note(fmt))
+
+
+def audio_track_selector(selector, audio):
+    """Require the selected language and any explicit audio role at extraction."""
+    language = audio.get("language") or ""
+    if re.fullmatch(r"[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*", language):
+        selector += f"[language={language}]"
+    role = audio_content_type(audio)
+    if role not in _AUDIO_ROLE_NOTES:
+        return selector
+
+    # Check the same evidence as the catalog. If the evidence changes, the
+    # format recovery can compare the freshly extracted metadata directly.
+    tag_prefix = r"(?i)[?&]xtags=(?:[^&#]*(?:%3a|:))?acont(?:%3d|=)"
+    tag_suffix = r"(?=%3a|:|[&#]|$)"
+    expected_tag = tag_prefix + role + tag_suffix
+    conflicting_tag = f"{tag_prefix}(?!{role}{tag_suffix})"
+    if _audio_role_from_url(audio.get("url")) == role:
+        return f"{selector}[url~='{expected_tag}']"
+    if _audio_role_from_url(audio.get("manifest_url")) == role:
+        return f"{selector}[manifest_url~='{expected_tag}'][url!~=?'{conflicting_tag}']"
+    if _audio_role_from_note(audio) != role:
+        # Restored transfers retain the role but omit their old signed URLs.
+        return (f"({selector}[url~='{expected_tag}']/"
+                f"{selector}[manifest_url~='{expected_tag}'][url!~=?'{conflicting_tag}'])")
+
+    selector += (f"[format_note~='(?i){_AUDIO_ROLE_NOTES[role]}']"
+                 f"[url!~=?'{conflicting_tag}'][manifest_url!~=?'{conflicting_tag}']")
+    higher_priority = list(_AUDIO_ROLE_NOTES).index(role)
+    if higher_priority:
+        other_notes = "|".join(list(_AUDIO_ROLE_NOTES.values())[:higher_priority])
+        selector += f"[format_note!~='(?i){other_notes}']"
+    return selector
+
+
+def guard_audio_tracks(fmt, selection):
+    audios = list(selection.get("audios") or ([selection["audio"]] if selection.get("audio") else []))
+    video = selection.get("video")
+    if video and video.get("acodec") not in (None, "none"):
+        audios.append(video)
+    by_id = {str(audio.get("format_id")): audio for audio in audios}
+    return "".join(audio_track_selector(part, by_id[part]) if part in by_id else part
+                   for part in re.split(r"([+,])", fmt))
 
 
 def original_language_info(data):
@@ -242,7 +294,7 @@ def _codec_prefix(codec, video=False):
     return match.group(0) if match else ("" if video else value)
 
 
-def _direct_stream_selector(kind, fmt, include_language=False, include_rate=False):
+def _direct_stream_selector(kind, fmt, include_rate=False):
     """Describe a direct stream semantically instead of by client-specific ID."""
     field = "vcodec" if kind == "video" else "acodec"
     prefix = _codec_prefix((fmt or {}).get(field), video=kind == "video")
@@ -252,16 +304,13 @@ def _direct_stream_selector(kind, fmt, include_language=False, include_rate=Fals
         filters.append(f"[{field}^={prefix}]")
     if kind == "video" and isinstance((fmt or {}).get("height"), (int, float)):
         filters.append(f"[height={int(fmt['height'])}]")
-    if kind == "audio" and include_language:
-        language = language_base((fmt or {}).get("language"))
-        if language:
-            filters.append(f"[language^={language}]")
     if kind == "audio" and include_rate:
         rate = audio_bitrate(fmt or {})
         if isinstance(rate, (int, float)) and rate > 0:
             tolerance = max(4, rate * 0.12)
             filters += [f"[abr>={rate - tolerance:.3f}]", f"[abr<={rate + tolerance:.3f}]"]
-    return selector + "".join(filters)
+    selector += "".join(filters)
+    return audio_track_selector(selector, fmt or {}) if kind == "audio" else selector
 
 
 def clip_format_selector(mode, video, audio, audios=None):
@@ -270,11 +319,11 @@ def clip_format_selector(mode, video, audio, audios=None):
     if mode == "audio":
         if len(audios) > 1:
             return ",".join(
-                _direct_stream_selector("audio", item, True, True)
+                _direct_stream_selector("audio", item, include_rate=True)
                 for item in audios)
         variants = [
-            _direct_stream_selector("audio", audio, language, rate)
-            for language, rate in ((True, True), (True, False), (False, True), (False, False))
+            _direct_stream_selector("audio", audio, include_rate=rate)
+            for rate in (True, False)
         ]
         return "/".join(dict.fromkeys(variants))
 
@@ -288,16 +337,16 @@ def clip_format_selector(mode, video, audio, audios=None):
         audio_prefix = _codec_prefix(video.get("acodec"))
         if audio_prefix:
             combined += f"[acodec^={audio_prefix}]"
-        return combined
+        return audio_track_selector(combined, video)
 
     if len(audios) > 1:
         return video_selector + "+" + "+".join(
-            _direct_stream_selector("audio", item, True, True)
+            _direct_stream_selector("audio", item, include_rate=True)
             for item in audios)
 
     audio_variants = [
-        _direct_stream_selector("audio", audio, language, rate)
-        for language, rate in ((True, True), (True, False), (False, True), (False, False))
+        _direct_stream_selector("audio", audio, include_rate=rate)
+        for rate in (True, False)
     ]
     return "/".join(
         video_selector + "+" + item

@@ -20,7 +20,10 @@ from contextlib import contextmanager
 from clip_strategy import NativeClipUnsupported, download_indexed_stream
 from download_rate import MAX_RATE_BPS, MIN_RATE_BPS
 from core_chapters import _arranged_clip_chapters, _ffmetadata_escape
-from core_formats import (human_size, language_base, language_label, MATROSKA_LANGUAGE_CODES, clip_format_selector, container_args)
+from core_formats import (
+    MATROSKA_LANGUAGE_CODES, audio_track_selector, clip_format_selector, container_args,
+    guard_audio_tracks, human_size, language_base, language_label,
+)
 from core_progress import (DownloadProgress, PROGRESS_PREFIX, PROGRESS_TEMPLATE, RESULT_PREFIX, RESULT_TEMPLATE, CLIP_INFO_PREFIX, progress_labels)
 from core_selection import MediaCatalog, equivalent_selection, select_formats, stream_profile
 from core_subtitles import clean_rolling_srt_file, trim_srt_file, format_timecode
@@ -894,6 +897,7 @@ class WindowsEngineMixin:
             '"filesize_approx":%(filesize_approx|null)j,'
             '"vcodec":%(vcodec|null)j,"acodec":%(acodec|null)j,'
             '"language":%(language|null)j,'
+            '"format_note":%(format_note|null)j,"manifest_url":%(manifest_url|null)j,'
             '"http_headers":%(http_headers|null)j}}')
         command = [
             self.ytdlp, "--newline", "--no-playlist", "--skip-download",
@@ -1224,10 +1228,7 @@ class WindowsEngineMixin:
                     # Cues, so their byte-to-time map cannot be reconstructed.
                     # Resolve the matching direct M4A stream and slice its SIDX
                     # instead. This remains a stream copy, never a re-encode.
-                    language = language_base(stream.get("language"))
-                    audio_selector = "bestaudio[protocol=https][ext=m4a]"
-                    if language:
-                        audio_selector += f"[language^={language}]"
+                    audio_selector = audio_track_selector("bestaudio[protocol=https][ext=m4a]", stream)
                     self._emit_event((
                         "download_phase",
                         "Extrait natif · piste WebM non indexée, utilisation de "
@@ -1551,7 +1552,16 @@ class WindowsEngineMixin:
             self, url, folder, mode, fmt, subtitle_lang, merge_format, clip, options,
             alternate_client=False, subtitle_completion=None, resume_source=None,
             retry_network=False, refreshed_catalog=None):
-        if clip and mode != "subtitles" and is_youtube_url(url):
+        youtube = is_youtube_url(url)
+        selection = {}
+        if youtube and not resume_source and refreshed_catalog is None and mode != "subtitles":
+            selection = self._saved_download_selection(url, mode, fmt)
+        if clip and mode != "subtitles" and youtube:
+            # Saved clips can contain older selectors that skipped the language
+            # filter when the selected audio was unavailable.
+            native_format = clip_format_selector(
+                mode, selection.get("video"), selection.get("audio"), selection.get("audios")
+            ) if selection else fmt
             native_attempts = [list(options)]
             alternate_options = alternate_youtube_options(options)
             if refreshed_catalog is None and alternate_options != list(options):
@@ -1564,9 +1574,9 @@ class WindowsEngineMixin:
                         "download_phase",
                         "Extrait natif · nouvel essai par une autre route YouTube…"))
                 try:
-                    if mode == "audio" and "," in fmt:
+                    if mode == "audio" and "," in native_format:
                         selectors = [
-                            item.strip() for item in fmt.split(",")
+                            item.strip() for item in native_format.split(",")
                             if item.strip()]
                         self._emit_event((
                             "download_phase",
@@ -1586,7 +1596,7 @@ class WindowsEngineMixin:
                             "download_done", combined_paths, folder))
                         return combined_paths
                     return self._download_native_clip(
-                        url, folder, mode, fmt, merge_format, clip,
+                        url, folder, mode, native_format, merge_format, clip,
                         attempt_options, subtitle_completion=subtitle_completion)
                 except InterruptedError:
                     self._emit_event(("download_cancelled",))
@@ -1651,7 +1661,7 @@ class WindowsEngineMixin:
             RESULT_TEMPLATE,
             "--progress-delta", "0.2",
             "-f",
-            fmt,
+            guard_audio_tracks(fmt, selection),
             "-o",
             output,
         ]
@@ -1691,7 +1701,7 @@ class WindowsEngineMixin:
             # and validated by yt-dlp; disable FFmpeg's second TLS check for the
             # direct range request only.
             ffmpeg_input_args = "-rw_timeout 15000000"
-            if is_youtube_url(url):
+            if youtube:
                 ffmpeg_input_args = "-tls_verify 0 " + ffmpeg_input_args
             cmd += ["--downloader-args", "ffmpeg_i:" + ffmpeg_input_args]
         # Remux also applies to a single stream; merging alone would ignore that case.
@@ -1988,11 +1998,11 @@ class WindowsEngineMixin:
                         kind="provider", options=tuple(without_pot_provider(options)))
                 if retry_network and not clip and transient_network_error(raw_details):
                     return _DownloadRetry(diagnostic_log(raw_details)[-500:])
-                if (not resume_source and is_youtube_url(url) and mode != "subtitles"
+                if (not resume_source and youtube and mode != "subtitles"
                         and format_access_unavailable(raw_details)):
                     return _UnavailableFormat(raw_details)
                 stream_forbidden = (
-                    not resume_source and mode != "subtitles" and is_youtube_url(url)
+                    not resume_source and mode != "subtitles" and youtube
                     and any("http error 403" in line.lower()
                             for line in output_lines
                             if line.startswith(("ERROR:", "[download]")))

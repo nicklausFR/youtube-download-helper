@@ -11,6 +11,7 @@ ROOT=Path(_output.name)
 sys.path.insert(0,str(PROJECT/"_dependencies"/"_python"))
 sys.path.insert(0,str(PROJECT))
 from qt_window import application
+from core_formats import guard_audio_tracks
 import youtube_downloader_gui as m
 import clip_strategy as clips
 from automatic_session import provider_options
@@ -297,7 +298,7 @@ class Features(unittest.TestCase):
         selector=m.clip_format_selector('video',video,audio)
         self.assertIn('bestvideo[protocol=https][vcodec^=avc1][height=720]',selector)
         self.assertIn('bestaudio[protocol=https][acodec^=mp4a]',selector)
-        self.assertIn('[language^=en]',selector)
+        self.assertIn('[language=en-US]',selector)
         self.assertIn('[abr>=',selector)
         self.assertNotIn('136',selector)
         self.assertNotIn('140',selector)
@@ -307,6 +308,36 @@ class Features(unittest.TestCase):
         audio_only=m.clip_format_selector('audio',None,audio)
         self.assertIn('bestaudio[protocol=https][acodec^=mp4a]',audio_only)
         self.assertNotIn('bestvideo',audio_only)
+
+    def test_ytdlp_rejects_a_format_id_reassigned_to_another_track(self):
+        selected = dict(audio('140-47', 'en-US', 129, 100), protocol='https',
+                        format_note='English (US) original',
+                        url='https://example.invalid/audio.m4a')
+        metadata = dict(id='fixture0001', title='Fixture', extractor='generic',
+                        extractor_key='Generic')
+        exact = guard_audio_tracks('140-47', {'audio': selected})
+        excerpt = m.clip_format_selector('audio', None, selected)
+        wrong_language = dict(selected, language='ko')
+        wrong_role = dict(selected, url='https://example.invalid/audio?xtags=acont%3Ddubbed-auto%3Alang%3Den-US')
+        with tempfile.TemporaryDirectory() as folder:
+            info = Path(folder) / 'formats.json'
+            for label, stream, selector, expected in (
+                    ('selected', selected, exact, True),
+                    ('reassigned id', wrong_language, exact, False),
+                    ('dub with the same language', wrong_role, exact, False),
+                    ('excerpt without original audio', wrong_language, excerpt, False)):
+                with self.subTest(label=label):
+                    info.write_text(json.dumps(dict(metadata, formats=[stream])), encoding='utf-8')
+                    result = subprocess.run(
+                        [self.a.ytdlp, '--ignore-config', '--simulate', '--load-info-json', str(info),
+                         '-f', selector, '--print', '%(format_id)s'],
+                        capture_output=True, text=True, timeout=15)
+                    if expected:
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertEqual(result.stdout.strip(), '140-47')
+                    else:
+                        self.assertIn('Requested format is not available', result.stderr)
+                        self.assertNotEqual(result.returncode, 0)
 
     def test_silent_downloader_is_stopped_instead_of_spinning_forever(self):
         a=self.a
@@ -453,7 +484,7 @@ class Features(unittest.TestCase):
                 'https://youtu.be/test',str(ROOT),'audio','251',None,(0,1),[])
         self.assertEqual(calls,[webm,m4a])
         self.assertEqual(info.call_args_list[1].args[1],
-                         'bestaudio[protocol=https][ext=m4a][language^=fr]')
+                         'bestaudio[protocol=https][ext=m4a][language=fr]')
 
     def test_native_clip_chapters_include_creator_and_sponsorblock_markers(self):
         chapters=self.a._arranged_clip_chapters(
@@ -681,12 +712,13 @@ class Features(unittest.TestCase):
                             format_note='English (US) original (default), medium')
         self.a.analysis_data = dict(DATA, formats=[chosen_video, chosen_audio])
         equivalent = dict(chosen_audio, format_id='140-4')
+        reused_id = dict(chosen_audio, language='ko', format_note='Korean, dubbed')
         wrong_dub = dict(chosen_audio, format_id='140-8', format_note='English (US), dubbed')
         wrong_video = dict(chosen_video, format_id='134', fps=60)
 
         for case in ('equivalent', 'ambiguous', 'different_video'):
             with self.subTest(case=case), tempfile.TemporaryDirectory() as folder:
-                formats = [chosen_video, equivalent, wrong_dub, wrong_video]
+                formats = [chosen_video, equivalent, reused_id, wrong_dub, wrong_video]
                 if case == 'ambiguous':
                     formats.append(dict(equivalent, format_id='140-7'))
                 fresh = dict(DATA, formats=formats)
@@ -714,7 +746,7 @@ class Features(unittest.TestCase):
                         self.assertEqual(command[command.index('-f') + 1], '135+140-4')
                         self.assertTrue(any(arg.startswith('temp:') for arg in command))
                         return success
-                    self.assertEqual(command[command.index('-f') + 1], '135+140-20')
+                    self.assertIn('135+140-20[language=en-US]', command[command.index('-f') + 1])
                     return unavailable
 
                 with patch.object(m.subprocess, 'Popen', side_effect=run) as popen:
