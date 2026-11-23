@@ -25,9 +25,10 @@ Stream refusals, rate limits, incomplete format lists and network timeouts trigg
 
 - **Automatic fallbacks:** start with yt-dlp's usual clients and BgUtils tokens, then try another client when needed. A failed token provider can be skipped. Selected quality is preserved.
 - **Bounded retries:** metadata analysis has time limits; rate-limited requests retry after a delay. Full downloads get up to three extra attempts for temporary network failures. Stalled transfers are stopped rather than left waiting indefinitely.
+- **Unavailable formats:** refresh the video’s streams and retry when the selected formats have a clear equivalent. If the selection cannot be recovered, choose from the refreshed formats.
 - **Google verification:** when needed, the app offers an isolated browser window for you to complete the check. It then resumes the same request using that session, without repeatedly reopening verification if access remains blocked.
 - **Separate subtitle recovery:** retry temporary failures up to five times per language. Auto-translated captions may wait before requesting them. A subtitle failure keeps the downloaded video; only missing subtitles need another attempt.
-- **Safe resume:** keep partial files, the destination folder, selected formats and queue for a manual retry. Clips never silently fall back to downloading the entire video.
+- **Safe resume:** reopening the app resumes a transfer that was running at exit and continues the queue. Manually paused transfers can be resumed from the list. The app keeps partial files and the destination folder. Clips never silently fall back to downloading the entire video.
 
 Diagnostics record errors and recovery attempts while masking credentials and signed URLs. Persistent YouTube restrictions may still require waiting.
 

@@ -720,6 +720,7 @@ class DownloadQueue(unittest.TestCase):
             self.assertFalse(self.a.pause_download_button.isEnabled())
             self.assertFalse(self.a.cancel_button.isEnabled())
             self.assertEqual(json.loads(save.call_args.args[1])['active']['progress'], 42)
+            self.assertFalse(json.loads(save.call_args.args[1])['resume_on_start'])
             self.finish('download_cancelled')
         self.assertTrue(self.a.download_retry_pending)
         self.assertFalse(self.a.cancel_requested)
@@ -822,8 +823,11 @@ class DownloadQueue(unittest.TestCase):
         self.a.events.put(('download_progress', 37, '37 Mo / 100 Mo'))
         self.a._poll_events()
         with patch.object(self.a.preferences, 'setValue') as save, \
-                patch.object(self.a.preferences, 'sync'):
-            save_checkpoint(self.a, flush=True)
+                patch.object(self.a.preferences, 'sync'), \
+                patch.object(self.a, '_save_download_checkpoint', save_checkpoint.__get__(self.a)), \
+                patch.object(self.a, '_finish_close') as close:
+            self.a._close_app()
+        close.assert_called_once()
         key, payload = save.call_args.args
         self.assertEqual(key, 'download_checkpoint')
         self.assertNotIn('secret.invalid', payload)
@@ -833,6 +837,7 @@ class DownloadQueue(unittest.TestCase):
         self.assertEqual(saved['selected'], UNSCHEDULED)
         self.assertEqual(len(saved['waiting']), 2)
         self.assertEqual(saved['active']['progress'], 37)
+        self.assertTrue(saved['resume_on_start'])
         restored = m.YoutubeDownloaderApp()
         try:
             restored.download_thread = None
@@ -868,13 +873,37 @@ class DownloadQueue(unittest.TestCase):
                                 for track in restored.subtitle_tracks))
             with patch.object(restored.orchestrator, 'download', return_value=MagicMock()) as run, \
                     patch.object(restored, '_request_download_folder') as folder:
-                restored.resume_download_button.click()
+                restored._dependencies_finished([], False)
                 self.assertEqual(run.call_args.args[0].url, FIRST)
                 self.assertEqual(run.call_args.args[0].folder, first[1])
                 self.assertEqual(restored.download_progress.value(), 37)
+                self.assertEqual(list(restored.queued_downloads), [THIRD, SECOND])
+                self.assertFalse(restored.resume_download_on_start)
                 folder.assert_not_called()
         finally:
             restored.dispose()
+
+    def test_changed_formats_show_updated_selection_while_queue_continues(self):
+        self.start()
+        self.start(SECOND, 'second')
+        updated = dict(self.a.active_download_data, formats=copy.deepcopy(DATA['formats']),
+                       _downloader_format_refresh=True)
+        updated['formats'][0]['format_id'] = 'new-video-id'
+        diagnostic = 'ERROR: Requested format is not available\nTraceback...'
+        with patch.object(m.messagebox, 'showinfo') as info:
+            self.a.events.put(('download_formats_changed', updated, diagnostic))
+            self.a._poll_events()
+        application().processEvents()
+        self.errors.assert_not_called()
+        info.assert_called_once()
+        self.assertIn('Choisissez les flux', info.call_args.args[1])
+        self.assertNotIn('Traceback', info.call_args.args[1])
+        self.assertEqual(self.requested_urls(), [FIRST, SECOND])
+        self.assertEqual(self.a.active_queue_url, SECOND)
+        self.assertEqual(self.a.url_var.get(), FIRST)
+        self.assertIs(self.a.analysis_data, updated)
+        self.assertIn('new-video-id', self.a._selection()['format'])
+        self.assertTrue(self.a.download_button.isEnabled())
 
     def test_closing_with_only_prepared_tabs_saves_order_and_selection(self):
         self.prepare(FIRST)

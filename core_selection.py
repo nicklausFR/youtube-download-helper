@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from core_formats import (
-    audio_bitrate, codec_name, estimated_bytes, format_fits_container,
+    audio_bitrate, audio_content_type, codec_name, estimated_bytes, format_fits_container,
     human_size, language_base,
 )
 from core_subtitles import parse_timecode
@@ -204,6 +204,54 @@ def select_formats(mode: str, video: Format | None = None,
     return {"format": "+".join([str(video.get("format_id"))]
                                + [str(item.get("format_id")) for item in audios]),
             "video": video, "audio": audios[0], "audios": audios}
+
+
+def stream_profile(stream: Format) -> tuple:
+    video = stream.get("vcodec")
+    audio = stream.get("acodec")
+    rate = audio_bitrate(stream)
+    return (
+        stream.get("ext"), video, audio,
+        stream.get("width"), stream.get("height"), stream.get("fps"),
+        stream.get("dynamic_range"),
+        (stream.get("language") or "").lower(), audio_content_type(stream),
+        stream.get("audio_channels"), stream.get("asr"),
+        round(rate) if isinstance(rate, (int, float)) else None,
+    )
+
+
+def equivalent_selection(mode: str, selection: Format, formats: list[Format],
+                         *, direct_only: bool = False) -> Format | None:
+    """Match the whole selection, including the order of multiple audio tracks."""
+    profiles = {}
+    for stream in formats:
+        if (re.fullmatch(r"[A-Za-z0-9_-]+", str(stream.get("format_id") or ""))
+                and stream.get("url") and not stream.get("has_drm")
+                and (not direct_only or stream.get("protocol") == "https")):
+            profiles.setdefault(stream_profile(stream), []).append(stream)
+
+    def match(saved):
+        if not saved.get("ext") or not saved.get("acodec") or not saved.get("vcodec"):
+            return None
+        if saved["vcodec"] != "none" and not (saved.get("height") and saved.get("fps")):
+            return None
+        if saved["vcodec"] == "none" and not (audio_bitrate(saved) and saved.get("language")):
+            return None
+        candidates = profiles.get(stream_profile(saved), [])
+        same_id = [item for item in candidates if item["format_id"] == saved.get("format_id")]
+        if len(same_id) == 1:
+            return same_id[0]
+        return candidates[0] if len(candidates) == 1 else None
+
+    video = selection.get("video")
+    audios = selection.get("audios") or ([selection["audio"]] if selection.get("audio") else [])
+    fresh_video = match(video) if video else None
+    fresh_audios = [match(track) for track in audios]
+    if (video and not fresh_video) or any(item is None for item in fresh_audios):
+        return None
+    if len({item["format_id"] for item in fresh_audios}) != len(fresh_audios):
+        return None
+    return select_formats(mode, fresh_video, fresh_audios)
 
 
 def estimate_size_label(selection: Format | None, mode: str,

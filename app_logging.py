@@ -207,6 +207,8 @@ def engine_event(engine, event):
     values = event[1:]
     if event[0] == 'analysis_ok':
         values = (event[1], catalog_summary(event[2]))
+    elif event[0] == 'download_formats_changed':
+        values = (catalog_summary(event[1]) if event[1] else None, event[2])
     elif event[0] == 'keyframe_ready':
         values = ('keyframe index ready',)
     log_event('engine.event', engine=hex(id(engine)), kind=event[0], values=values)

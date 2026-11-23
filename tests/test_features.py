@@ -674,34 +674,63 @@ class Features(unittest.TestCase):
         try:callback()
         except Exception as error:errors.append(error)
 
-    def test_missing_mweb_format_retries_with_another_youtube_client(self):
-        def failed_process(*args,**kwargs):
-            process=MagicMock()
-            process.stdout=io.StringIO(
-                'WARNING: Some mweb client https formats have been skipped as they are missing a URL; SABR-only\n'
-                'ERROR: Requested format is not available\n')
-            process.wait.return_value=1;process.poll.return_value=1
-            return process
-        options=['--plugin-dirs','plugins','--extractor-args','youtube:player_client=mweb',
-                 '--extractor-args','youtubepot-bgutilscript:server_home=provider']
-        with patch.object(m.subprocess,'Popen',side_effect=failed_process) as popen:
-            self.a._download_with_access(
-                'https://youtu.be/test',str(ROOT),'video_only','720',None,None,None,options)
-        self.assertEqual(popen.call_count,2)
-        first=popen.call_args_list[0].args[0]
-        retry=popen.call_args_list[1].args[0]
-        self.assertIn('youtube:player_client=mweb',first)
-        self.assertNotIn('youtube:player_client=mweb',retry)
-        self.assertIn('youtubepot-bgutilscript:server_home=provider',retry)
-        events=[]
-        while not self.a.events.empty():events.append(self.a.events.get_nowait())
-        self.assertTrue(any(
-            event[0]=='download_phase' and 'autre route' in event[1]
-            for event in events),events)
-        verification=next(event for event in events if event[0]=='verification_required')
-        self.assertIn('aucune des deux routes',verification[2])
-        self.assertEqual(verification[3][3],'720')
-        self.assertFalse(any(event[0]=='download_error' for event in events))
+    def test_unavailable_format_restarts_only_with_a_unique_equivalent(self):
+        chosen_video = dict(video('135', 480, 500), url='https://example.invalid/video.mp4')
+        chosen_audio = dict(audio('140-20', 'en-US', 129, 100),
+                            url='https://example.invalid/audio.m4a',
+                            format_note='English (US) original (default), medium')
+        self.a.analysis_data = dict(DATA, formats=[chosen_video, chosen_audio])
+        equivalent = dict(chosen_audio, format_id='140-4')
+        wrong_dub = dict(chosen_audio, format_id='140-8', format_note='English (US), dubbed')
+        wrong_video = dict(chosen_video, format_id='134', fps=60)
+
+        for case in ('equivalent', 'ambiguous', 'different_video'):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as folder:
+                formats = [chosen_video, equivalent, wrong_dub, wrong_video]
+                if case == 'ambiguous':
+                    formats.append(dict(equivalent, format_id='140-7'))
+                fresh = dict(DATA, formats=formats)
+                if case == 'different_video':
+                    fresh['id'] = 'different00'
+                unavailable = MagicMock()
+                unavailable.stdout = io.StringIO(
+                    'WARNING: Earlier request returned HTTP Error 429\n'
+                    'ERROR: Requested format is not available\n')
+                unavailable.wait.return_value = 1
+                listed = MagicMock(returncode=0)
+                listed.communicate.return_value = (json.dumps(fresh), '')
+                success = MagicMock()
+                success.stdout = io.StringIO('')
+                success.wait.return_value = 0
+
+                def run(command, **kwargs):
+                    if '--dump-single-json' in command:
+                        self.assertIn('verified.cookies', command)
+                        return listed
+                    if '--load-info-json' in command:
+                        payload = Path(command[command.index('--load-info-json') + 1])
+                        self.assertEqual(json.loads(payload.read_text(encoding='utf-8'))['formats'],
+                                         [chosen_video, equivalent])
+                        self.assertEqual(command[command.index('-f') + 1], '135+140-4')
+                        self.assertTrue(any(arg.startswith('temp:') for arg in command))
+                        return success
+                    self.assertEqual(command[command.index('-f') + 1], '135+140-20')
+                    return unavailable
+
+                with patch.object(m.subprocess, 'Popen', side_effect=run) as popen:
+                    self.a._download_with_access(
+                        'https://youtu.be/urFIHf5coxE', folder, 'video', '135+140-20',
+                        None, 'mkv', None, ['--cookies', 'verified.cookies'])
+                self.assertEqual(popen.call_count, 3 if case == 'equivalent' else 2)
+                events = []
+                while not self.a.events.empty():
+                    events.append(self.a.events.get_nowait())
+                terminal = [event for event in events if event[0] in (
+                    'download_done', 'download_error', 'download_formats_changed', 'verification_required')]
+                self.assertEqual([event[0] for event in terminal],
+                                 ['download_done' if case == 'equivalent' else 'download_formats_changed'])
+                if case != 'equivalent':
+                    self.assertEqual(terminal[0][1]['formats'], formats)
 
     def test_youtube_stream_403_retries_once_with_the_same_format_and_output(self):
         error = "ERROR: unable to download video data: HTTP Error 403: Forbidden\n"

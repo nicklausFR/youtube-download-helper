@@ -60,7 +60,7 @@ from windows_adapter import (
 from youtube_access import (
     is_youtube_url, youtube_video_id, clean_ansi, extraction_issue, diagnostic_log,
     ACCESS_CHOICES, cookie_access_problem, cookie_access_failed,
-    access_args, readable_error, needs_verification, format_access_unavailable,
+    access_args, readable_error, needs_verification,
     without_forced_mweb, subtitle_retryable, request_access_options,
 )
 from windows_engine import WindowsEngine, WindowsEngineMixin
@@ -223,6 +223,7 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
         self.last_download_request = None
         self.active_download_job = None
         self.download_retry_pending = False
+        self.resume_download_on_start = False
         self.download_results = []
         self.download_result_folder = ''
         self._shutdown_dialog = None
@@ -323,7 +324,7 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
             tracks = subtitle_choices(data, None if inferred else language)
         saved = {key: data[key] for key in (
             'title', 'id', 'duration', 'language', 'is_live', 'live_status',
-            '_downloader_access_recovery',
+            '_downloader_access_recovery', '_downloader_format_refresh',
         ) if key in data}
         saved.update(self._video_description_snapshot(data))
         saved['formats'] = [self._format_snapshot(item) for item in data.get('formats') or []]
@@ -349,6 +350,7 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
                 language=data.get('language'),
                 formats=[self._format_snapshot(item) for item in data.get('formats') or []],
                 _downloader_access_recovery=data.get('_downloader_access_recovery'),
+                _downloader_format_refresh=data.get('_downloader_format_refresh'),
                 **self._video_description_snapshot(data)))
         if job.get('partial_path'):
             saved['partial_path'] = job['partial_path']
@@ -388,6 +390,9 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
         saved = dict(
             tabs=tabs, selected=self.queue_view_url,
             active=active,
+            resume_on_start=bool(active and (self.resume_download_on_start or (
+                self.download_thread is not None and not self.download_pause_requested
+                and not self.subtitle_retry_pending and not self.download_verification_pending))),
             waiting=list(waiting.values()),
             completed=self.completed_downloads.copy(),
             list_order=list(self.download_list_order),
@@ -530,6 +535,7 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
             self.active_download_data = active['data']
             self.active_download_tracks = active['tracks']
             self.download_retry_pending = True
+            self.resume_download_on_start = saved.get('resume_on_start') is True
             progress = active.get('progress')
             self.download_progress_value = (
                 progress if isinstance(progress, (int, float)) and 0 < progress <= 100
@@ -639,6 +645,8 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
         self._render_dependencies()
         self._update_download_button_state()
         if not missing:
+            if self.resume_download_on_start:
+                self._resume_failed_download()
             if self.queued_downloads and not self._transfer_busy():
                 viewed_url = self.queue_view_url
                 self._activate_next_queued_url(keep_prepared=True)
@@ -1523,8 +1531,10 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
         self.url_var.set(url)
         self._save_download_checkpoint()
 
-    def _finish_active_queue_item(self, *, keep_tab=False, succeeded=False, partial=False):
+    def _finish_active_queue_item(self, *, keep_tab=False, succeeded=False, partial=False,
+                                  keep_selection=False):
         self.download_retry_pending = False
+        self.resume_download_on_start = False
         self.download_verification_pending = False
         self.subtitle_retry_pending = False
         completed = self.last_download_request
@@ -1542,7 +1552,9 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
             return
         def advance():
             if self.last_download_request is completed:
-                preserve_view = self.list_view and self.queue_view_url in self.pending_urls
+                preserve_view = (
+                    (self.list_view and self.queue_view_url in self.pending_urls)
+                    or (keep_selection and self.queue_view_url == completed[0]))
                 self._activate_next_queued_url(keep_prepared=keep_tab, select_tab=not preserve_view)
                 if succeeded and self._can_shutdown_after_downloads(completed):
                     self._show_shutdown_countdown(completed)
@@ -2906,6 +2918,7 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
             self.after(100, self._close_app)
             return
         self._save_download_checkpoint(flush=True)
+        self.cancel_requested = True
         self.verification_cancel.set()
         if self.queue_analysis_orchestrator is not None:
             self.queue_analysis_orchestrator.cancel()
@@ -2978,6 +2991,7 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
         self.download_thread = self.orchestrator.download(DownloadRequest(
             request[0], request[1], request[2], request[3], request[4],
             request[5], request[6], self.verified_credentials), validate=False)
+        self._save_download_checkpoint()
         self._update_download_button_state()
         self._render_download_queue()
 
@@ -3089,6 +3103,7 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
         sel = job['selection']
         self.active_download_job = job
         self.download_retry_pending = False
+        self.resume_download_on_start = False
         self.active_download_data = job['data']
         self.active_download_tracks = job['tracks']
         self.last_download_request = request
@@ -3145,10 +3160,10 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
         if subtitle_lang:
             self._append_download_detail(
                 f"Sous-titres demandés : {subtitle_lang}.")
-        self._save_download_checkpoint()
         self.download_thread = self.orchestrator.download(DownloadRequest(
             url, folder, mode, fmt, subtitle_lang, merge_format, clip,
             self._session_requested(), partial_path=partial_path), validate=False)
+        self._save_download_checkpoint()
         self._render_download_queue()
         self._update_download_button_state()
 
@@ -3202,6 +3217,36 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
             self._finish_active_queue_item(keep_tab=True)
             self._render_download_queue()
             self._update_download_button_state()
+
+    def _show_updated_download_formats(self, catalog, diagnostic):
+        self.download_thread = None
+        self.download_progress.stop()
+        self.cancel_button.setEnabled(False)
+        if diagnostic:
+            self._append_download_detail(diagnostic)
+        job = self.active_download_job
+        if not catalog or not job:
+            self._hold_failed_download()
+            messagebox.showwarning(
+                APP_TITLE,
+                "Le format choisi est indisponible et la liste des flux n’a pas pu être actualisée. "
+                "Cliquez sur Reprendre pour réessayer.",
+            )
+            return
+
+        url = job["request"][0]
+        key = (url, self.access_var.get())
+        self.analysis_cache[key] = (time.monotonic(), catalog)
+        self.tab_analysis_data[key] = catalog
+        self._finish_active_queue_item(keep_tab=True, keep_selection=True)
+        self._show_queue_tab(url)
+        self.status_var.set("Formats actualisés · choisissez à nouveau vos flux.")
+        self._update_download_button_state()
+        messagebox.showinfo(
+            APP_TITLE,
+            "Le format choisi est indisponible. Les formats de cette vidéo ont été actualisés. "
+            "Choisissez les flux souhaités, puis relancez le téléchargement.",
+        )
 
     def _download_progress_labels(self):
         return progress_labels(self.active_download_data or self.analysis_data)
@@ -3367,15 +3412,17 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
                     log_event('ui.event', kind=kind)
 
                 if self.closing_transfer_tab_url and (
-                        kind == 'download_error' or (kind == 'verification_required' and event[1] is None)):
+                        kind in ('download_error', 'download_formats_changed')
+                        or (kind == 'verification_required' and event[1] is None)):
                     kind = 'download_cancelled'
                 if (kind in ('download_done', 'download_cancelled', 'download_error',
+                             'download_formats_changed',
                              'subtitle_retry_done', 'subtitle_retry_failed')
                         or (kind == 'verification_required' and event[1] is None)):
                     self.download_progress.setFormat("%p %")
 
                 if self.download_pause_requested:
-                    stopped = (kind in ('download_cancelled', 'download_error')
+                    stopped = (kind in ('download_cancelled', 'download_error', 'download_formats_changed')
                                or (kind == 'verification_required' and event[1] is None))
                     if stopped:
                         self.download_pause_requested = False
@@ -3859,6 +3906,9 @@ class YoutubeDownloaderApp(WindowsEngineMixin, DownloaderWindow):
                     self._finish_active_queue_item(keep_tab=not self.closing_transfer_tab_url)
                     self._render_download_queue()
                     self._update_download_button_state()
+
+                elif kind == "download_formats_changed":
+                    self._show_updated_download_formats(event[1], event[2])
 
                 elif kind == "download_error":
                     self.download_progress.stop()

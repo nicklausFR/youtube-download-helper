@@ -448,6 +448,12 @@
 <message><source>fin</source><translation>end</translation></message>
 <message><source>Incluse</source><translation>Included</translation></message>
 <message><source>yt-dlp introuvable.</source><translation>yt-dlp not found.</translation></message>
+<message><source>Le format sélectionné est indisponible.</source><translation>The selected format is unavailable.</translation></message>
+<message><source>Format indisponible · actualisation des flux YouTube…</source><translation>Format unavailable · refreshing YouTube streams…</translation></message>
+<message><source>Flux équivalents trouvés · reprise automatique…</source><translation>Equivalent streams found · resuming automatically…</translation></message>
+<message><source>Formats actualisés · choisissez à nouveau vos flux.</source><translation>Formats refreshed · select your streams again.</translation></message>
+<message><source>Le format choisi est indisponible et la liste des flux n’a pas pu être actualisée. Cliquez sur Reprendre pour réessayer.</source><translation>The selected format is unavailable, and the stream list could not be refreshed. Click Resume to try again.</translation></message>
+<message><source>Le format choisi est indisponible. Les formats de cette vidéo ont été actualisés. Choisissez les flux souhaités, puis relancez le téléchargement.</source><translation>The selected format is unavailable. The formats for this video have been refreshed. Select the streams you want and restart the download.</translation></message>
 <message><source>Installez yt-dlp depuis la section Dépendances ou ajoute yt-dlp au PATH Windows.</source><translation>Install yt-dlp from Dependencies or add yt-dlp to the Windows PATH.</translation></message>
 <message><source>FFmpeg est nécessaire pour fusionner les flux ou changer de conteneur.</source><translation>FFmpeg is required to merge streams or change containers.</translation></message>
 <message><source>Installez FFmpeg depuis la section Dépendances ou ajoute FFmpeg au PATH Windows.</source><translation>Install FFmpeg from Dependencies or add FFmpeg to the Windows PATH.</translation></message>

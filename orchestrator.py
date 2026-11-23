@@ -14,7 +14,7 @@ from youtube_access import is_youtube_url
 
 TERMINAL_EVENTS = {
     "analysis_ok", "analysis_error", "analysis_cancelled", "download_done", "download_error",
-    "download_cancelled", "subtitle_retry_done", "subtitle_retry_failed",
+    "download_cancelled", "download_formats_changed", "subtitle_retry_done", "subtitle_retry_failed",
     "verification_required",
 }
 
@@ -113,7 +113,7 @@ class DownloadOrchestrator:
         return self._record_event(event)
 
     def _record_event(self, event: tuple) -> tuple:
-        if (event[0] in ("download_done", "download_error", "download_cancelled",
+        if (event[0] in ("download_done", "download_error", "download_cancelled", "download_formats_changed",
                          "subtitle_retry_done", "subtitle_retry_failed")
                 or (event[0] == "verification_required" and event[1] is None)):
             # Real engines defer these events until cleanup is complete. Join
@@ -141,7 +141,7 @@ class DownloadOrchestrator:
                 self.download_thread = None
             else:
                 self.analysis_thread = None
-        elif event[0] in ("download_done", "download_error", "download_cancelled",
+        elif event[0] in ("download_done", "download_error", "download_cancelled", "download_formats_changed",
                           "subtitle_retry_done", "subtitle_retry_failed"):
             self.download_thread = None
         return event

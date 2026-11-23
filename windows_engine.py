@@ -3,6 +3,7 @@
 import json
 from dataclasses import dataclass
 from functools import wraps
+from hashlib import sha256
 from app_logging import (log_event, log_exception, engine_event, start_process,
                          process_result, verbose_options)
 import os
@@ -21,11 +22,12 @@ from download_rate import MAX_RATE_BPS, MIN_RATE_BPS
 from core_chapters import _arranged_clip_chapters, _ffmetadata_escape
 from core_formats import (human_size, language_base, language_label, MATROSKA_LANGUAGE_CODES, clip_format_selector, container_args)
 from core_progress import (DownloadProgress, PROGRESS_PREFIX, PROGRESS_TEMPLATE, RESULT_PREFIX, RESULT_TEMPLATE, CLIP_INFO_PREFIX, progress_labels)
+from core_selection import MediaCatalog, equivalent_selection, select_formats, stream_profile
 from core_subtitles import clean_rolling_srt_file, trim_srt_file, format_timecode
 from partial_recovery import find_resumable_format
 from verified_session import VerifiedCredentials
 from windows_adapter import (CREATE_NO_WINDOW, terminate_process_tree, find_executable, ffprobe_for, _video_keyframe_times, _first_video_frame_time, _media_streams)
-from youtube_access import (access_args, cookie_access_failed, diagnostic_log, needs_verification, request_access_options, clean_ansi, subtitle_retryable, format_access_unavailable, is_youtube_url)
+from youtube_access import (access_args, cookie_access_failed, diagnostic_log, needs_verification, request_access_options, clean_ansi, subtitle_retryable, format_access_unavailable, is_youtube_url, youtube_video_id)
 from strategies import DEFAULT_ACCESS, DEFAULT_DOWNLOADS
 from youtube_access import (
     ACCESS_FALLBACK_SEPARATOR, POT_VERSION_TIMEOUT_MESSAGE, pot_provider_failed,
@@ -47,7 +49,8 @@ DOWNLOAD_RETRY_DELAYS = (2, 5, 10)
 
 _DOWNLOAD_TERMINAL_EVENTS = {
     "download_done", "download_error", "download_cancelled",
-    "subtitle_retry_done", "subtitle_retry_failed", "verification_required",
+    "download_formats_changed", "subtitle_retry_done", "subtitle_retry_failed",
+    "verification_required",
 }
 _worker_events = threading.local()
 _RATE_RESTART = object()
@@ -58,6 +61,12 @@ class _DownloadRetry:
     reason: str
     kind: str = "network"
     options: tuple | None = None
+
+
+@dataclass(frozen=True)
+class _UnavailableFormat:
+    diagnostic: str
+    retry_automatically: bool = True
 
 
 def _after_download_cleanup(method):
@@ -171,7 +180,6 @@ class WindowsEngineMixin:
 
 
     def _analyze_worker(self, url, token, session=False, fallback=False):
-        from youtube_access import youtube_video_id
         log_event('analysis.start', engine=hex(id(self)), video_id=youtube_video_id(url),
                   url=url, generation=token, timeout=ANALYSIS_TIMEOUT_SECONDS)
         deadline = time.monotonic() + ANALYSIS_TIMEOUT_SECONDS
@@ -445,7 +453,6 @@ class WindowsEngineMixin:
     @_after_download_cleanup
     def _download_worker(self, url, folder, mode, fmt, subtitle_lang, merge_format,
                          clip=None, session=False, *, partial_path=None):
-        from youtube_access import youtube_video_id
         log_event('download.start', engine=hex(id(self)), video_id=youtube_video_id(url),
                   url=url, folder=folder, mode=mode, format_id=fmt, subtitles=subtitle_lang,
                   container=merge_format, clip=clip, partial_path=partial_path,
@@ -505,39 +512,41 @@ class WindowsEngineMixin:
                     terminate_process_tree(self.subtitle_process)
                 subtitle_job["thread"].join(timeout=10)
 
+    def _read_download_metadata(self, url, options, *, phase):
+        """Extract current formats with the transfer's access options."""
+        if self.cancel_requested:
+            return None, "", False
+        cmd = [self.ytdlp, '--skip-download', *options, '--dump-single-json', '--no-playlist', url]
+        proc = start_process(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             text=True, encoding='utf-8', errors='replace',
+                             creationflags=CREATE_NO_WINDOW)
+        self.download_process = proc
+        timed_out = False
+        stderr = ""
+        try:
+            if self.cancel_requested:
+                terminate_process_tree(proc)
+                return None, "", False
+            stdout, stderr = proc.communicate(timeout=AUTOMATIC_ANALYSIS_TIMEOUT_SECONDS)
+            if not self.cancel_requested and proc.returncode == 0:
+                return json.loads(stdout), diagnostic_log(stderr), False
+        except subprocess.TimeoutExpired as expired:
+            timed_out = True
+            terminate_process_tree(proc)
+            stderr = expired.stderr or ""
+            if isinstance(stderr, bytes):
+                stderr = stderr.decode('utf-8', errors='replace')
+        finally:
+            process_result(proc, phase=phase, output=stderr, timeout=timed_out)
+            self.download_process = None
+        return None, diagnostic_log(stderr).strip(), timed_out
+
     def _read_partial_metadata(self, url, options):
         """Retry a transient extraction failure once before inspecting the partial."""
         for attempt in range(2):
-            if self.cancel_requested:
-                return None
-            cmd = [self.ytdlp, *options, '--dump-single-json', '--no-playlist', url]
-            proc = start_process(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                    text=True, encoding='utf-8', errors='replace',
-                                    creationflags=CREATE_NO_WINDOW)
-            self.download_process = proc
-            timed_out = False
-            stdout = stderr = ''
-            try:
-                if self.cancel_requested:
-                    terminate_process_tree(proc)
-                    return None
-                stdout, stderr = proc.communicate(timeout=AUTOMATIC_ANALYSIS_TIMEOUT_SECONDS)
-            except subprocess.TimeoutExpired as expired:
-                timed_out = True
-                terminate_process_tree(proc)
-                stderr = expired.stderr or ""
-                if isinstance(stderr, bytes):
-                    stderr = stderr.decode('utf-8', errors='replace')
-            finally:
-                process_result(proc, phase='partial_metadata', output=stderr, timeout=timed_out)
-                self.download_process = None
-
-            if self.cancel_requested:
-                return None
-            if not timed_out and proc.returncode == 0:
-                return json.loads(stdout)
-
-            error = diagnostic_log(stderr).strip()
+            data, error, timed_out = self._read_download_metadata(url, options, phase='partial_metadata')
+            if self.cancel_requested or data is not None:
+                return data
             final_error = error.rsplit('ERROR:', 1)[-1].lower()
             network_timeout = timed_out or 'timed out' in final_error or 'timeout' in final_error
             provider_failed = '--plugin-dirs' in options and (timed_out or pot_provider_failed(error))
@@ -889,8 +898,12 @@ class WindowsEngineMixin:
         command = [
             self.ytdlp, "--newline", "--no-playlist", "--skip-download",
             "--sponsorblock-mark", "all", "-f", fmt,
-            "--print", "before_dl:" + template, *options, url,
+            "--print", "before_dl:" + template, *options,
         ]
+        if fmt.count("+") >= 2:
+            command.append("--audio-multistreams")
+        if "--load-info-json" not in options:
+            command.append(url)
         process = start_process(
             command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, encoding="utf-8", errors="replace", bufsize=1,
@@ -1405,9 +1418,87 @@ class WindowsEngineMixin:
         return destination
 
 
+    def _saved_download_selection(self, url, mode, fmt):
+        job = getattr(self, "active_download_job", None)
+        if job and job["request"][0] == url:
+            return job["selection"]
+        data = getattr(self, "analysis_data", None) or {}
+        if data.get("id") != youtube_video_id(url):
+            return {}
+        by_id = {item.get("format_id"): item for item in data.get("formats") or []}
+        streams = [by_id.get(item) for item in re.split(r"[+,]", fmt)]
+        if not all(streams):
+            return {}
+        return select_formats(mode, audios=streams) if mode == "audio" else (
+            select_formats(mode, streams[0], streams[1:]) or {})
+
+    def _recover_download_formats(self, url, folder, mode, fmt, subtitle_lang,
+                                  merge_format, clip, options, failure,
+                                  alternate_client, subtitle_completion):
+        self._emit_event(("download_phase", "Format indisponible · actualisation des flux YouTube…"))
+        selection = self._saved_download_selection(url, mode, fmt)
+        previous = getattr(self, "active_download_data", None) or getattr(self, "analysis_data", None) or {}
+        expected_id = youtube_video_id(url) or previous.get("id")
+        routes = [options]
+        alternate = alternate_youtube_options(options)
+        if not alternate_client and alternate != list(options):
+            routes.append(alternate)
+        catalog = None
+        diagnostics = [failure.diagnostic]
+        for route in routes:
+            try:
+                data, diagnostic, _ = self._read_download_metadata(url, route, phase="format_refresh")
+            except (OSError, ValueError) as error:
+                data, diagnostic = None, str(error)
+            if self.cancel_requested:
+                self._emit_event(("download_cancelled",))
+                return
+            diagnostics.append(diagnostic)
+            if not isinstance(data, dict) or not data.get("formats"):
+                continue
+            available = MediaCatalog.from_analysis(data)
+            if not (available.videos_by_height or available.audio_formats):
+                continue
+            data["_downloader_diagnostics"] = diagnostic
+            data["_downloader_format_refresh"] = True
+            if "--no-plugin-dirs" in route:
+                data["_downloader_access_recovery"] = "without_provider"
+            elif "youtube:player_client=mweb" in route:
+                data["_downloader_access_recovery"] = "mweb"
+            if catalog is None or len(data["formats"]) > len(catalog["formats"]):
+                catalog = data
+            if not failure.retry_automatically:
+                break
+            if not expected_id or data.get("id") != expected_id:
+                continue
+            equivalent = equivalent_selection(mode, selection or {}, data["formats"],
+                                              direct_only=bool(clip))
+            if equivalent is None:
+                continue
+
+            # Pin the new IDs to the catalog that was checked. A second extraction
+            # could assign the same IDs to different tracks.
+            with tempfile.TemporaryDirectory(prefix="yd-format-") as folder_info:
+                path = Path(folder_info) / "formats.json"
+                streams = [item for item in [equivalent.get("video"), *equivalent.get("audios", [])]
+                           if item is not None]
+                pinned = dict(data, formats=streams)
+                pinned.pop("requested_downloads", None)
+                pinned.pop("requested_formats", None)
+                path.write_text(json.dumps(pinned), encoding="utf-8")
+                self._emit_event(("download_phase", "Flux équivalents trouvés · reprise automatique…"))
+                return self._download_with_access(
+                    url, folder, mode, equivalent["format"], subtitle_lang,
+                    merge_format, clip, [*route, "--load-info-json", str(path)],
+                    alternate_client=True, subtitle_completion=subtitle_completion,
+                    refreshed_catalog=data)
+
+        self._emit_event(("download_formats_changed", catalog, diagnostic_log("\n".join(diagnostics))))
+
     def _download_with_access(
             self, url, folder, mode, fmt, subtitle_lang, merge_format, clip, options,
-            alternate_client=False, subtitle_completion=None, resume_source=None):
+            alternate_client=False, subtitle_completion=None, resume_source=None,
+            refreshed_catalog=None):
         # A rate change restarts the same request iteratively. Repeated changes
         # must not accumulate recursive calls or let an old attempt close a new one.
         network_retries = 0
@@ -1419,7 +1510,18 @@ class WindowsEngineMixin:
                 url, folder, mode, fmt, subtitle_lang, merge_format, clip, options,
                 alternate_client=alternate_client,
                 subtitle_completion=subtitle_completion, resume_source=resume_source,
-                retry_network=network_retries < len(DOWNLOAD_RETRY_DELAYS))
+                retry_network=network_retries < len(DOWNLOAD_RETRY_DELAYS),
+                refreshed_catalog=refreshed_catalog)
+            if isinstance(result, _UnavailableFormat):
+                if self.cancel_requested:
+                    self._emit_event(("download_cancelled",))
+                elif refreshed_catalog is not None:
+                    self._emit_event(("download_formats_changed", refreshed_catalog, result.diagnostic))
+                else:
+                    return self._recover_download_formats(
+                        url, folder, mode, fmt, subtitle_lang, merge_format, clip, options,
+                        result, alternate_client, subtitle_completion)
+                return
             if isinstance(result, _DownloadRetry):
                 if result.options is not None:
                     options = list(result.options)
@@ -1448,21 +1550,21 @@ class WindowsEngineMixin:
     def _download_with_access_attempt(
             self, url, folder, mode, fmt, subtitle_lang, merge_format, clip, options,
             alternate_client=False, subtitle_completion=None, resume_source=None,
-            retry_network=False):
+            retry_network=False, refreshed_catalog=None):
         if clip and mode != "subtitles" and is_youtube_url(url):
             native_attempts = [list(options)]
             alternate_options = alternate_youtube_options(options)
-            if alternate_options != list(options):
+            if refreshed_catalog is None and alternate_options != list(options):
                 native_attempts.append(alternate_options)
             native_errors = []
             for attempt_index, attempt_options in enumerate(native_attempts, start=1):
+                combined_paths = []
                 if attempt_index > 1:
                     self._emit_event((
                         "download_phase",
                         "Extrait natif · nouvel essai par une autre route YouTube…"))
                 try:
                     if mode == "audio" and "," in fmt:
-                        combined_paths = []
                         selectors = [
                             item.strip() for item in fmt.split(",")
                             if item.strip()]
@@ -1490,6 +1592,8 @@ class WindowsEngineMixin:
                     self._emit_event(("download_cancelled",))
                     return
                 except NativeClipUnsupported as error:
+                    if format_access_unavailable(str(error)):
+                        return _UnavailableFormat(str(error), retry_automatically=not combined_paths)
                     native_errors.append(str(error).strip())
             details = "\n\n".join(
                 f"Route {index + 1} : {error}"
@@ -1518,6 +1622,20 @@ class WindowsEngineMixin:
                   else os.path.join(output_folder, output_name))
         download_started = time.time()
 
+        data = refreshed_catalog or getattr(self, "active_download_data", None) or getattr(self, "analysis_data", None)
+        staging = None
+        if (mode != "subtitles" and not clip and not resume_source
+                and data and data.get("_downloader_format_refresh")):
+            # A new selection may share a title with an incompatible old .part.
+            # Keep working files separate while preserving the final output name.
+            destination = Path(folder).resolve()
+            by_id = {stream.get("format_id"): stream for stream in data.get("formats", [])}
+            profiles = tuple(stream_profile(by_id[code]) for code in re.split(r"[+,]", fmt)
+                             if code in by_id)
+            fingerprint = sha256(repr((url, mode, fmt, merge_format, profiles)).encode("utf-8")).hexdigest()[:16]
+            staging = destination / ".youtube-download-helper" / fingerprint
+            output = output_name
+
         cmd = [
             self.ytdlp,
             "--newline",
@@ -1537,6 +1655,8 @@ class WindowsEngineMixin:
             "-o",
             output,
         ]
+        if staging:
+            cmd += ["--paths", f"home:{destination}", "--paths", f"temp:{staging}"]
         started_rate_revision = getattr(self, "download_rate_revision", 0)
         rate_limit = getattr(self, "download_rate_bps", 0)
         if rate_limit:
@@ -1582,15 +1702,16 @@ class WindowsEngineMixin:
 
         if resume_source:
             cmd += ['--load-info-json', resume_source[1]]
-        else:
+        elif "--load-info-json" not in options:
             cmd.append(url)
 
         try:
             output_lines = []
             result_paths = []
-            data = getattr(self, "active_download_data", None) or getattr(self, "analysis_data", None)
             progress = DownloadProgress(
-                fmt, mode=mode, labels=self._download_progress_labels(), data=data)
+                fmt, mode=mode,
+                labels=progress_labels(data) if refreshed_catalog else self._download_progress_labels(),
+                data=data)
 
             # Before the first progress event we are still connecting. A rate
             # change must take effect then too, but never interrupt a remux.
@@ -1867,37 +1988,22 @@ class WindowsEngineMixin:
                         kind="provider", options=tuple(without_pot_provider(options)))
                 if retry_network and not clip and transient_network_error(raw_details):
                     return _DownloadRetry(diagnostic_log(raw_details)[-500:])
-                missing_format = not resume_source and format_access_unavailable(raw_details)
+                if (not resume_source and is_youtube_url(url) and mode != "subtitles"
+                        and format_access_unavailable(raw_details)):
+                    return _UnavailableFormat(raw_details)
                 stream_forbidden = (
                     not resume_source and mode != "subtitles" and is_youtube_url(url)
                     and any("http error 403" in line.lower()
                             for line in output_lines
                             if line.startswith(("ERROR:", "[download]")))
                 )
-                if (missing_format or stream_forbidden) and not alternate_client:
+                if stream_forbidden and not alternate_client:
                     alternate_options = alternate_youtube_options(options)
                     if alternate_options != list(options):
                         self.download_process = None
-                        reason = ("Flux refusé par YouTube (HTTP 403)" if stream_forbidden
-                                  else "Format momentanément retiré par YouTube")
                         return _DownloadRetry(
-                            f"{reason} · essai automatique par une autre route…",
+                            "Flux refusé par YouTube (HTTP 403) · essai automatique par une autre route…",
                             kind="route", options=tuple(alternate_options))
-                if missing_format:
-                    self.download_process = None
-                    unavailable = (
-                        "Le format choisi n’est disponible par aucune des deux routes YouTube testées."
-                        if alternate_client else "YouTube ne fournit plus le format choisi."
-                    )
-                    details = (
-                        unavailable + " Une vérification Google peut rétablir son accès."
-                        + (" La vidéo complète ne sera pas téléchargée." if precise_video_clip else "")
-                        + "\n\n" + raw_details)
-                    self._emit_event((
-                        "verification_required", None, details,
-                        (url, folder, mode, fmt, subtitle_lang, merge_format, clip),
-                    ))
-                    return
                 # Return useful yt-dlp diagnostics instead of only the exit code.
                 useful = []
                 for item in output_lines:
@@ -1950,6 +2056,12 @@ class WindowsEngineMixin:
                 self.download_process = None
             if clip_temp:
                 shutil.rmtree(clip_temp, ignore_errors=True)
+            if staging:
+                try:
+                    staging.rmdir()
+                    staging.parent.rmdir()
+                except OSError:
+                    pass
 
 
 class WindowsEngine(WindowsEngineMixin):

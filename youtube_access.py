@@ -118,6 +118,8 @@ def readable_error(error):
         cause = (POT_VERSION_TIMEOUT_MESSAGE if pot_provider_version_timed_out(first_error)
                  else "L’accès automatique a échoué.")
         return cause + " L’accès de secours a également échoué.\n\n" + readable_error(final_error)
+    if format_access_unavailable(error):
+        return "Le format sélectionné est indisponible."
     low=error.lower()
     if pot_provider_version_timed_out(error):
         return POT_VERSION_TIMEOUT_MESSAGE + "\n\n" + diagnostic_log(error)[-1000:]
@@ -146,17 +148,16 @@ def readable_error(error):
 
 
 def needs_verification(error):
+    if format_access_unavailable(error):
+        return False
     low = error.lower()
     return any(text in low for text in ("not a bot", "anti-robot", "429", "youtube limite"))
 
 
 def format_access_unavailable(error):
-    """A selected YouTube format vanished between analysis and download."""
-    low = (error or "").lower()
-    return (
-        "requested format is not available" in low
-        or ("sabr-only" in low and "missing a url" in low)
-    )
+    """Identify the final yt-dlp format error independently of earlier warnings."""
+    final_error = clean_ansi(error or "").rsplit("ERROR:", 1)[-1].lower()
+    return "requested format is not available" in final_error
 
 
 def without_forced_mweb(options):
